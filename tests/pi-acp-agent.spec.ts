@@ -1388,7 +1388,11 @@ describe("createAgentApp", () => {
       sessionFactory: async () => ({ session: mockSession }),
     });
 
-    await client().connectWith(app, (ctx) => ctx.request("session/new", newSessionReq()));
+    await client().connectWith(app, async (ctx) => {
+      // ACP SDK 2.x rejects any request sent before the initialize handshake.
+      await ctx.request("initialize", { protocolVersion: PROTOCOL_VERSION });
+      return ctx.request("session/new", newSessionReq());
+    });
     await Bun.sleep(10);
 
     expect(mockSession.dispose).toHaveBeenCalled();

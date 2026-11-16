@@ -10,11 +10,12 @@
     "format": "oxfmt --write",
     "lint": "oxlint --fix",
     "lint:agent": "oxlint --fix -f agent",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "sync:pi": "bun add --exact @earendil-works/pi-coding-agent@$(pi --version)"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.7.0",
-    "@earendil-works/pi-coding-agent": "^1.0.3"
+    "@agentclientprotocol/sdk": "2.7.0",
+    "@earendil-works/pi-coding-agent": "1.5.2"
   },
   "devDependencies": {
     "@types/bun": "latest",
