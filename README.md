@@ -31,7 +31,8 @@ Pi does not support ACP out of the box. While there are a few ACP adapters that 
 - **Subagent cards** — [pi-subagents](https://github.com/nicobailon/pi-subagents) runs show their children live: one card per workflow child, or the single child in the call's own card, with model, counters, current and recent tools, then the output.
 - **Context, compaction and retries** — Reports context fill and cost after each turn (`usage_update`), and compactions and auto-retries to clients that support them.
 - **Auto session naming** — Automatically derives session names from the initial prompt. Set `AZPI_SESSION_NAMING_MODEL` to a `provider/modelId` to generate names via LLM. Falls back to the heuristic trimming method.
-- **Client tool proxy** — Delegates `read`, `write`, `edit`, and `bash` to the ACP client when available, enabling editors like Zed to display agent change diffs and live terminals. Paths the client refuses (outside its project) fall back to the disk.
+- **Client tool proxy** — Runs Pi's own `read`, `write`, `edit`, and `bash` tools with their file and process access routed through the ACP client when available, enabling editors like Zed to show unsaved buffers to the agent, review its edits, and display live terminals. Paths the client refuses (outside its project) fall back to the disk.
+- **Handshake record** — Keeps the client's last `initialize` request in `$XDG_STATE_HOME/azpi/last-initialize.json` (default `~/.local/state`), to check what the editor advertises.
 - **Slash commands** — Supports Pi's built-in commands (`/name`, `/session`, `/compact`, `/export`, and `/reload`), skills, prompt templates, and extension commands (opt-in via `AZPI_ALLOW_EXTENSION_COMMANDS`, disabled by default).
 
 ## Usage
