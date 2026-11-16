@@ -1,11 +1,14 @@
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { version as PI_VERSION } from "../node_modules/@earendil-works/pi-coding-agent/package.json";
 import { version as AGENT_VERSION } from "../package.json";
+import { BUNDLED_PI_VERSION } from "./pi-version";
 
 /**
  * Builds a markdown startup message with agent metadata for display in the ACP client.
  */
-export function buildStartupMessage({ resourceLoader }: AgentSession): string {
+export function buildStartupMessage(
+  { resourceLoader }: AgentSession,
+  versionWarning?: string,
+): string {
   const { agentsFiles } = resourceLoader.getAgentsFiles();
   const { extensions } = resourceLoader.getExtensions();
   const { skills } = resourceLoader.getSkills();
@@ -13,8 +16,9 @@ export function buildStartupMessage({ resourceLoader }: AgentSession): string {
   return [
     `### AZPi v${AGENT_VERSION}`,
     "",
-    `Using Pi coding agent v${PI_VERSION}`,
+    `Using Pi coding agent v${BUNDLED_PI_VERSION}`,
     "",
+    ...(versionWarning ? [`> **Warning:** ${versionWarning}`, ""] : []),
     "**Contexts:**",
     getSortedBulletList(agentsFiles, (f) => f.path),
     "",

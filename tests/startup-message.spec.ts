@@ -31,6 +31,17 @@ describe("buildStartupMessage", () => {
     expect(result).toContain(PI_VERSION);
   });
 
+  it("shows the version warning when one is given", () => {
+    const session = createMockSession({});
+    const result = buildStartupMessage(session, "Pi CLI is v9.9.9");
+    expect(result).toContain("**Warning:** Pi CLI is v9.9.9");
+  });
+
+  it("has no warning line without a warning", () => {
+    const session = createMockSession({});
+    expect(buildStartupMessage(session)).not.toContain("Warning");
+  });
+
   it("lists context file paths", () => {
     const session = createMockSession({
       getAgentsFiles: () => ({

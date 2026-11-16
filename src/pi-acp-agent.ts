@@ -76,6 +76,8 @@ export interface PiAcpAgentOptions {
   modelRegistry?: ModelRegistry;
   /** Optional session factory for testing */
   sessionFactory?: (cwd: string) => Promise<{ session: AgentSession }>;
+  /** Resolves to a warning shown in the startup message, e.g. a Pi version drift */
+  startupWarning?: Promise<string | undefined>;
 }
 
 /**
@@ -157,16 +159,7 @@ export class PiAcpAgent {
     // so session/update notifications sent before the response are silently dropped.
     setImmediate(() => {
       this.safeNotify(() => this.discoverAndEmitCommands(sessionId));
-      this.safeNotify(() =>
-        this.client.notify("session/update", {
-          sessionId,
-          update: {
-            content: { text: buildStartupMessage(session), type: "text" },
-            sessionUpdate: SessionUpdateType.AgentMessageChunk,
-          },
-        }),
-      );
-      this.startupMessageSent.add(sessionId);
+      this.sendStartupMessage(sessionId, session);
     });
 
     return {
@@ -288,16 +281,7 @@ export class PiAcpAgent {
       this.safeNotify(() => this.discoverAndEmitCommands(sessionId));
     }
     if (!this.startupMessageSent.has(sessionId)) {
-      this.startupMessageSent.add(sessionId);
-      this.safeNotify(() =>
-        this.client.notify("session/update", {
-          sessionId,
-          update: {
-            content: { text: buildStartupMessage(session), type: "text" },
-            sessionUpdate: SessionUpdateType.AgentMessageChunk,
-          },
-        }),
-      );
+      this.sendStartupMessage(sessionId, session);
     }
 
     const { text, images } = convertPromptContent(prompt, session.model);
@@ -409,6 +393,20 @@ export class PiAcpAgent {
 
   async close(): Promise<void> {
     await Promise.all([...this.sessions.keys()].map((id) => this.cleanupSession(id)));
+  }
+
+  private sendStartupMessage(sessionId: string, session: AgentSession): void {
+    this.startupMessageSent.add(sessionId);
+    this.safeNotify(async () => {
+      const warning = await this.options.startupWarning;
+      await this.client.notify("session/update", {
+        sessionId,
+        update: {
+          content: { text: buildStartupMessage(session, warning), type: "text" },
+          sessionUpdate: SessionUpdateType.AgentMessageChunk,
+        },
+      });
+    });
   }
 
   private buildConfigOptions(session: AgentSession): SessionConfigOption[] {
