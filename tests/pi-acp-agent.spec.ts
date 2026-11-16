@@ -190,6 +190,19 @@ describe("PiAcpAgent", () => {
   });
 
   describe("newSession", () => {
+    it("hands each initialize request to onInitialize", async () => {
+      const seen: unknown[] = [];
+      const agent = new PiAcpAgent(createMockConnection(), {
+        modelRuntime: createMockModelRuntime(),
+        onInitialize: (request) => seen.push(request.clientCapabilities),
+      });
+      await agent.initialize({
+        clientCapabilities: { terminal: true },
+        protocolVersion: PROTOCOL_VERSION,
+      });
+      expect(seen).toEqual([{ terminal: true }]);
+    });
+
     it("stores clientCapabilities from initialize", async () => {
       const models = [createMockModel()];
       const conn = createMockConnection();

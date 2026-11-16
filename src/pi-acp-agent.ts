@@ -79,6 +79,8 @@ export interface PiAcpAgentOptions {
   sessionFactory?: (cwd: string) => Promise<{ session: AgentSession }>;
   /** Resolves to a warning shown in the startup message, e.g. a Pi version drift */
   startupWarning?: Promise<string | undefined>;
+  /** Called with each initialize request, before answering it */
+  onInitialize?: (request: InitializeRequest) => void;
 }
 
 /**
@@ -116,8 +118,9 @@ export class PiAcpAgent {
     this.extensionWhitelist = parseExtensionWhitelist();
   }
 
-  async initialize({ clientCapabilities }: InitializeRequest): Promise<InitializeResponse> {
-    this.clientCapabilities = clientCapabilities;
+  async initialize(request: InitializeRequest): Promise<InitializeResponse> {
+    this.options.onInitialize?.(request);
+    this.clientCapabilities = request.clientCapabilities;
 
     const anyModelSupportsImage = this.availableModels.some((m) => m.input.includes("image"));
 

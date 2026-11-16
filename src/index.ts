@@ -6,6 +6,7 @@
 import { ndJsonStream } from "@agentclientprotocol/sdk";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Readable, Writable } from "node:stream";
+import { recordHandshake } from "./handshake-record";
 import { createAgentApp } from "./pi-acp-agent";
 import { BUNDLED_PI_VERSION, describePiVersionDrift, detectInstalledPiVersion } from "./pi-version";
 
@@ -15,6 +16,12 @@ const startupWarning = detectInstalledPiVersion().then((installed) =>
 );
 const modelRuntime = await ModelRuntime.create();
 const stream = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));
-const connection = createAgentApp({ modelRuntime, startupWarning }).connect(stream);
+const onInitialize = (request: Parameters<typeof recordHandshake>[0]) => {
+  // A diagnostic aid: failing to keep it must not stop the agent.
+  recordHandshake(request).catch((error: unknown) => {
+    console.error(`AZPi could not record the client handshake: ${String(error)}`);
+  });
+};
+const connection = createAgentApp({ modelRuntime, startupWarning, onInitialize }).connect(stream);
 
 await connection.closed;
