@@ -1,8 +1,9 @@
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import type { AgentContext } from "@agentclientprotocol/sdk";
+import type { AgentContext, SessionUpdate } from "@agentclientprotocol/sdk";
 import { extractMessageText } from "./event-bridge";
 import { SessionUpdateType } from "./session-update-types";
+import { ToolCallMapper } from "./tool-call-mapper";
 
 /**
  * Resolves a Pi session UUID to its JSONL file path.
@@ -68,7 +69,10 @@ export async function replaySessionHistory(
   // entries including abandoned branches, which would replay stale
   // messages from earlier /tree navigations.
   const entries = session.sessionManager.getBranch();
+  const tools = new ToolCallMapper({ cwd: session.sessionManager.getCwd(), live: false });
   const updates: Promise<void>[] = [];
+  const send = (update: SessionUpdate) =>
+    updates.push(client.notify("session/update", { sessionId, update }));
 
   for (const entry of entries) {
     if (entry.type !== "message") continue;
@@ -78,20 +82,15 @@ export async function replaySessionHistory(
 
     if (role === "user") {
       const text = extractMessageText(message);
-      if (!text) continue;
-      updates.push(
-        client.notify("session/update", {
-          sessionId,
-          update: {
-            sessionUpdate: SessionUpdateType.UserMessageChunk,
-            content: { type: "text", text },
-          },
-        }),
-      );
+      if (text)
+        send({
+          sessionUpdate: SessionUpdateType.UserMessageChunk,
+          content: { type: "text", text },
+        });
     } else if (role === "assistant") {
-      replayAssistantMessage(message as any, sessionId, client, updates);
+      replayAssistantMessage(message as any, tools, send);
     } else if (role === "toolResult") {
-      replayToolResult(message as any, sessionId, client, updates);
+      replayToolResult(message as any, tools, send);
     }
   }
 
@@ -101,22 +100,16 @@ export async function replaySessionHistory(
 /** Emit thinking, tool-call, and text blocks from an assistant message. */
 function replayAssistantMessage(
   message: any,
-  sessionId: string,
-  client: AgentContext,
-  updates: Promise<void>[],
+  tools: ToolCallMapper,
+  send: (update: SessionUpdate) => void,
 ): void {
   const content = message.content;
   if (typeof content === "string") {
     if (content.length > 0) {
-      updates.push(
-        client.notify("session/update", {
-          sessionId,
-          update: {
-            sessionUpdate: SessionUpdateType.AgentMessageChunk,
-            content: { type: "text", text: content },
-          },
-        }),
-      );
+      send({
+        sessionUpdate: SessionUpdateType.AgentMessageChunk,
+        content: { type: "text", text: content },
+      });
     }
     return;
   }
@@ -129,51 +122,26 @@ function replayAssistantMessage(
     if (block.type === "thinking") {
       const thinking = block.thinking;
       if (typeof thinking === "string" && thinking.length > 0) {
-        updates.push(
-          client.notify("session/update", {
-            sessionId,
-            update: {
-              sessionUpdate: SessionUpdateType.AgentThoughtChunk,
-              content: { type: "text", text: thinking },
-            },
-          }),
-        );
+        send({
+          sessionUpdate: SessionUpdateType.AgentThoughtChunk,
+          content: { type: "text", text: thinking },
+        });
       }
     } else if (block.type === "toolCall") {
-      const toolCallId = block.id;
-      const toolName = block.name;
-      const argsStr = safeStringify(block.arguments);
-      if (typeof toolCallId === "string" && typeof toolName === "string") {
-        updates.push(
-          client.notify("session/update", {
-            sessionId,
-            update: {
-              sessionUpdate: SessionUpdateType.ToolCall,
-              toolCallId,
-              title: toolName,
-              status: "pending",
-              content: [
-                {
-                  type: "content" as const,
-                  content: { type: "text" as const, text: argsStr },
-                },
-              ],
-            },
-          }),
-        );
+      if (typeof block.id === "string" && typeof block.name === "string") {
+        // Pending until its result entry, so a call that never got one does not look finished.
+        send({
+          sessionUpdate: SessionUpdateType.ToolCall,
+          ...tools.start(block.id, block.name, block.arguments, "pending"),
+        });
       }
     } else if (block.type === "text") {
       const text = block.text;
       if (typeof text === "string" && text.length > 0) {
-        updates.push(
-          client.notify("session/update", {
-            sessionId,
-            update: {
-              sessionUpdate: SessionUpdateType.AgentMessageChunk,
-              content: { type: "text", text },
-            },
-          }),
-        );
+        send({
+          sessionUpdate: SessionUpdateType.AgentMessageChunk,
+          content: { type: "text", text },
+        });
       }
     }
   }
@@ -182,53 +150,17 @@ function replayAssistantMessage(
 /** Emit a tool_call_update for a completed tool result. */
 function replayToolResult(
   message: any,
-  sessionId: string,
-  client: AgentContext,
-  updates: Promise<void>[],
+  tools: ToolCallMapper,
+  send: (update: SessionUpdate) => void,
 ): void {
-  const toolCallId = message.toolCallId;
-  const isError = !!message.isError;
-  if (typeof toolCallId !== "string") return;
-
-  const resultText = extractTextFromToolResult(message.content);
-
-  updates.push(
-    client.notify("session/update", {
-      sessionId,
-      update: {
-        sessionUpdate: SessionUpdateType.ToolCallUpdate,
-        toolCallId,
-        status: isError ? "failed" : "completed",
-        content: [
-          {
-            type: "content" as const,
-            content: { type: "text" as const, text: resultText },
-          },
-        ],
-      },
-    }),
-  );
-}
-
-/** Extract text from a tool result's content (string or content-block array). */
-function extractTextFromToolResult(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return safeStringify(content);
-
-  const parts: string[] = [];
-  for (const block of content) {
-    if (block && typeof block === "object" && (block as Record<string, unknown>).type === "text") {
-      const text = (block as Record<string, unknown>).text;
-      if (typeof text === "string") parts.push(text);
-    }
-  }
-  return parts.length > 0 ? parts.join("") : safeStringify(content);
-}
-
-function safeStringify(value: unknown): string {
-  try {
-    return JSON.stringify(value, undefined, 2);
-  } catch {
-    return String(value);
-  }
+  if (typeof message.toolCallId !== "string") return;
+  send({
+    sessionUpdate: SessionUpdateType.ToolCallUpdate,
+    ...tools.end(
+      message.toolCallId,
+      String(message.toolName ?? ""),
+      message,
+      Boolean(message.isError),
+    ),
+  });
 }

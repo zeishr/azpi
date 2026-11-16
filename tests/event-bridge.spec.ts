@@ -3,19 +3,31 @@ import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import type { StopReason } from "@agentclientprotocol/sdk";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { mapFinalContent, mapSessionEvent, mapStopReason } from "../src/event-bridge";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import {
+  SessionEventBridge,
+  buildUsageUpdate,
+  mapFinalContent,
+  mapStopReason,
+} from "../src/event-bridge";
 
 const SID = "test-session";
 
+function bridge(capabilities?: ClientCapabilities): SessionEventBridge {
+  return new SessionEventBridge({ sessionId: SID, cwd: "/repo", capabilities });
+}
+
+const asEvent = (value: unknown) => value as AgentSessionEvent;
+
 describe("event-bridge", () => {
-  describe("mapSessionEvent", () => {
+  describe("SessionEventBridge", () => {
     it("maps message_update text_delta to agent_message_chunk", () => {
       const event = {
         assistantMessageEvent: { delta: "Hello world", type: "text_delta" },
         message: { content: "Hello world", role: "assistant" },
         type: "message_update" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("agent_message_chunk");
       expect(result!.sessionId).toBe(SID);
@@ -28,7 +40,7 @@ describe("event-bridge", () => {
         message: { content: [], role: "assistant" },
         type: "message_update" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).toBeNull();
     });
 
@@ -38,7 +50,7 @@ describe("event-bridge", () => {
         message: { content: "Hello world", role: "assistant" },
         type: "message_update" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).toBeNull();
     });
 
@@ -49,12 +61,68 @@ describe("event-bridge", () => {
         toolName: "bash",
         type: "tool_execution_start" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("tool_call");
       expect(result!.sessionId).toBe(SID);
       expect((result!.update as any).toolCallId).toBe("tc-1");
-      expect((result!.update as any).status).toBe("pending");
+      // Pi emits tool_execution_start when the tool actually starts running.
+      expect((result!.update as any).status).toBe("in_progress");
+      expect((result!.update as any).title).toBe("`ls`");
+      expect((result!.update as any).kind).toBe("execute");
+    });
+
+    it("keeps a tool's arguments from start to end, where its result needs them", () => {
+      const b = bridge();
+      b.map(
+        asEvent({
+          type: "tool_execution_start",
+          toolCallId: "tc-read",
+          toolName: "read",
+          args: { path: "src/main.rs" },
+        }),
+      );
+      const end = b.map(
+        asEvent({
+          type: "tool_execution_end",
+          toolCallId: "tc-read",
+          toolName: "read",
+          result: { content: [{ type: "text", text: "fn main() {}" }] },
+          isError: false,
+        }),
+      );
+      // The language comes from the path given at start, absent from the end event.
+      expect((end!.update as any).content[0].content.text).toBe("```rs\nfn main() {}\n```");
+    });
+
+    it("leaves a terminal-backed bash card alone while it streams", () => {
+      const update = bridge().map(
+        asEvent({
+          type: "tool_execution_update",
+          toolCallId: "tc-sh",
+          toolName: "bash",
+          args: { command: "sleep 1" },
+          partialResult: {
+            content: [{ type: "text", text: "..." }],
+            details: { terminalId: "t1" },
+          },
+        }),
+      );
+      expect(update).toBeNull();
+    });
+
+    it("ends a terminal-backed bash call without resending the released terminal", () => {
+      const end = bridge().map(
+        asEvent({
+          type: "tool_execution_end",
+          toolCallId: "tc-sh",
+          toolName: "bash",
+          result: { content: [{ type: "text", text: "done" }], details: { terminalId: "t1" } },
+          isError: false,
+        }),
+      );
+      expect((end!.update as any).status).toBe("completed");
+      expect("content" in end!.update).toBe(false);
     });
 
     it("maps tool_execution_update to tool_call_update", () => {
@@ -65,7 +133,7 @@ describe("event-bridge", () => {
         toolName: "bash",
         type: "tool_execution_update" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("tool_call_update");
       expect((result!.update as any).status).toBe("in_progress");
@@ -79,7 +147,7 @@ describe("event-bridge", () => {
         toolName: "bash",
         type: "tool_execution_end" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("tool_call_update");
       expect((result!.update as any).status).toBe("completed");
@@ -93,7 +161,7 @@ describe("event-bridge", () => {
         toolName: "bash",
         type: "tool_execution_end" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("tool_call_update");
       expect((result!.update as any).status).toBe("failed");
@@ -101,7 +169,7 @@ describe("event-bridge", () => {
 
     it("returns null for agent_start", () => {
       const event = { type: "agent_start" as const } as unknown as AgentSessionEvent;
-      expect(mapSessionEvent(event, SID)).toBeNull();
+      expect(bridge().map(event)).toBeNull();
     });
 
     it("returns null for agent_end", () => {
@@ -109,7 +177,7 @@ describe("event-bridge", () => {
         messages: [],
         type: "agent_end" as const,
       } as unknown as AgentSessionEvent;
-      expect(mapSessionEvent(event, SID)).toBeNull();
+      expect(bridge().map(event)).toBeNull();
     });
 
     it("maps message_update thinking_delta to agent_thought_chunk", () => {
@@ -118,7 +186,7 @@ describe("event-bridge", () => {
         message: { content: "Let me think...", role: "assistant" },
         type: "message_update" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("agent_thought_chunk");
       expect(result!.sessionId).toBe(SID);
@@ -131,7 +199,7 @@ describe("event-bridge", () => {
         message: { content: [], role: "assistant" },
         type: "message_update" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).toBeNull();
     });
 
@@ -140,7 +208,7 @@ describe("event-bridge", () => {
         name: "My Session",
         type: "session_info_changed" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("session_info_update");
       expect(result!.sessionId).toBe(SID);
@@ -152,7 +220,7 @@ describe("event-bridge", () => {
         name: undefined,
         type: "session_info_changed" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("session_info_update");
       expect((result!.update as any).title).toBeNull();
@@ -173,7 +241,7 @@ describe("event-bridge", () => {
           type: "select",
         },
       ];
-      const result = mapSessionEvent(event, SID, configOptions);
+      const result = bridge().map(event, configOptions);
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("config_option_update");
       expect(result!.sessionId).toBe(SID);
@@ -185,8 +253,101 @@ describe("event-bridge", () => {
         level: "high",
         type: "thinking_level_changed" as const,
       } as unknown as AgentSessionEvent;
-      const result = mapSessionEvent(event, SID);
+      const result = bridge().map(event);
       expect(result).toBeNull();
+    });
+  });
+
+  describe("compaction updates", () => {
+    const start = asEvent({ type: "compaction_start", reason: "threshold" });
+    const end = (fields: Record<string, unknown>) =>
+      asEvent({ type: "compaction_end", reason: "threshold", willRetry: false, ...fields });
+    const compactionClient = { session: { compaction: {} } } as ClientCapabilities;
+
+    it("stays silent for a client that did not advertise compaction support", () => {
+      const b = bridge();
+      expect(b.map(start)).toBeNull();
+      expect(b.map(end({ aborted: false, result: { summary: "s" } }))).toBeNull();
+    });
+
+    it("announces a compaction and completes it under the same id", () => {
+      const b = bridge(compactionClient);
+      const started = b.map(start)!.update as any;
+      const ended = b.map(end({ aborted: false, result: { summary: "Kept the plan" } }))!
+        .update as any;
+      expect(started).toMatchObject({ sessionUpdate: "compaction_update", status: "in_progress" });
+      expect(ended.compactionId).toBe(started.compactionId);
+      expect(ended.status).toBe("completed");
+      expect(ended.summary).toEqual([{ type: "text", text: "Kept the plan" }]);
+    });
+
+    it("gives each compaction its own id", () => {
+      const b = bridge(compactionClient);
+      const first = (b.map(start)!.update as any).compactionId;
+      b.map(end({ aborted: false, result: { summary: "s" } }));
+      expect((b.map(start)!.update as any).compactionId).not.toBe(first);
+    });
+
+    it("reports aborted and failed compactions", () => {
+      const b = bridge(compactionClient);
+      b.map(start);
+      expect((b.map(end({ aborted: true }))!.update as any).status).toBe("cancelled");
+      b.map(start);
+      const failed = b.map(end({ aborted: false, errorMessage: "model refused" }))!.update as any;
+      expect(failed).toMatchObject({ status: "failed", error: "model refused" });
+    });
+  });
+
+  describe("retry notices", () => {
+    const retry = asEvent({
+      type: "auto_retry_start",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 1000,
+      errorMessage: "overloaded",
+    });
+    const noticesClient = { session: { notices: {} } } as ClientCapabilities;
+
+    it("stays silent for a client that did not advertise notice support", () => {
+      expect(bridge().map(retry)).toBeNull();
+    });
+
+    it("warns about a retry with the error that caused it", () => {
+      expect(bridge(noticesClient).map(retry)!.update).toEqual({
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "Retrying after an error (attempt 1 of 3)",
+        description: "overloaded",
+      });
+    });
+
+    it("reports a final failure but not a successful retry", () => {
+      const b = bridge(noticesClient);
+      expect(b.map(asEvent({ type: "auto_retry_end", success: true, attempt: 2 }))).toBeNull();
+      const failure = b.map(
+        asEvent({ type: "auto_retry_end", success: false, attempt: 3, finalError: "overloaded" }),
+      )!.update as any;
+      expect(failure).toMatchObject({ severity: "error", description: "overloaded" });
+    });
+  });
+
+  describe("buildUsageUpdate", () => {
+    it("reports the context fill and the session cost", () => {
+      expect(
+        buildUsageUpdate({ tokens: 1234.6, contextWindow: 200000, percent: 0.6 }, 0.42),
+      ).toEqual({
+        sessionUpdate: "usage_update",
+        used: 1235,
+        size: 200000,
+        cost: { amount: 0.42, currency: "USD" },
+      });
+    });
+
+    it("skips the update while Pi does not know the context fill", () => {
+      expect(
+        buildUsageUpdate({ tokens: null, contextWindow: 200000, percent: null }, 0),
+      ).toBeNull();
+      expect(buildUsageUpdate(undefined, 0)).toBeNull();
     });
   });
 

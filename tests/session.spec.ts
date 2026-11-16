@@ -145,6 +145,7 @@ function createMockSessionWithEntries(entries: any[]): AgentSession {
 
   const mockSessionManager = {
     getBranch: () => entries,
+    getCwd: () => "/repo",
   };
 
   return {
@@ -243,8 +244,84 @@ describe("replaySessionHistory", () => {
     const call = (conn.sessionUpdate.mock.calls as any[])[0][0];
     expect(call.update.sessionUpdate).toBe("tool_call");
     expect(call.update.toolCallId).toBe("call_1");
-    expect(call.update.title).toBe("read");
+    expect(call.update.title).toBe("Read /foo");
+    expect(call.update.kind).toBe("read");
+    expect(call.update.locations).toEqual([{ path: "/foo" }]);
     expect(call.update.status).toBe("pending");
+  });
+
+  it("replays an edit with the diff it proposed", async () => {
+    const conn = createMockConnection();
+    const session = createMockSessionWithEntries([
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call_edit",
+              name: "edit",
+              arguments: { path: "src/a.ts", edits: [{ oldText: "a", newText: "b" }] },
+            },
+          ],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "call_edit",
+          toolName: "edit",
+          content: [{ type: "text", text: "Successfully replaced 1 block" }],
+          details: { firstChangedLine: 4 },
+          isError: false,
+        },
+      },
+    ]);
+
+    await replaySessionHistory(session, "test-session", conn);
+
+    const [start, end] = (conn.sessionUpdate.mock.calls as any[]).map((call) => call[0].update);
+    expect(start.content).toEqual([
+      { type: "diff", path: "/repo/src/a.ts", oldText: "a", newText: "b" },
+    ]);
+    // The result keeps the diff on the card and points at the changed line.
+    expect(end.content).toBeUndefined();
+    expect(end.locations).toEqual([{ path: "/repo/src/a.ts", line: 4 }]);
+  });
+
+  it("replays a terminal-backed bash call with its output, since the terminal is gone", async () => {
+    const conn = createMockConnection();
+    const session = createMockSessionWithEntries([
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "call_sh", name: "bash", arguments: { command: "ls" } },
+          ],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "call_sh",
+          toolName: "bash",
+          content: [{ type: "text", text: "a.ts" }],
+          details: { terminalId: "term-1", exitCode: 0 },
+          isError: false,
+        },
+      },
+    ]);
+
+    await replaySessionHistory(session, "test-session", conn);
+
+    const end = (conn.sessionUpdate.mock.calls as any[])[1][0].update;
+    expect(end.content).toEqual([
+      { type: "content", content: { type: "text", text: "```console\na.ts\n```" } },
+    ]);
   });
 
   it("replays mixed assistant content in order", async () => {
@@ -297,7 +374,7 @@ describe("replaySessionHistory", () => {
     expect(call.update.sessionUpdate).toBe("tool_call_update");
     expect(call.update.toolCallId).toBe("call_abc");
     expect(call.update.status).toBe("completed");
-    expect(call.update.content[0].content.text).toBe("file contents here");
+    expect(call.update.content[0].content.text).toBe("```\nfile contents here\n```");
   });
 
   it("replays tool result errors as failed", async () => {

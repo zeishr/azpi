@@ -1,104 +1,73 @@
-import type { ToolCall, ToolCallUpdate } from "@agentclientprotocol/sdk";
-import type { AgentEvent } from "@earendil-works/pi-agent-core";
+import type { ToolCall, ToolCallStatus, ToolCallUpdate } from "@agentclientprotocol/sdk";
+import {
+  presentResultLocations,
+  presentToolCall,
+  presentToolProgress,
+  presentToolResult,
+} from "./tool-presentation";
+import type { PresentationContext, ToolOutcome } from "./tool-presentation";
 
 /**
- * Maps a Pi tool_execution_start event to an ACP ToolCall notification.
- */
-export function mapToolCallStart(event: AgentEvent & { type: "tool_execution_start" }): ToolCall {
-  const argsStr = safeJsonStringify(event.args);
-  return {
-    content: [
-      {
-        content: { text: argsStr, type: "text" },
-        type: "content",
-      },
-    ],
-    rawInput: event.args,
-    status: "pending",
-    title: event.toolName,
-    toolCallId: event.toolCallId,
-  };
-}
-
-/**
- * Maps a Pi tool_execution_update event to an ACP ToolCallUpdate notification.
- */
-export function mapToolCallUpdate(
-  event: AgentEvent & { type: "tool_execution_update" },
-): ToolCallUpdate {
-  const textContent = extractTextFromToolResult(event.partialResult);
-  return {
-    content: [
-      {
-        content: { text: textContent, type: "text" },
-        type: "content",
-      },
-    ],
-    status: "in_progress",
-    toolCallId: event.toolCallId,
-  };
-}
-
-/**
- * Maps a Pi tool_execution_end event to an ACP ToolCallUpdate notification.
- */
-export function mapToolCallEnd(event: AgentEvent & { type: "tool_execution_end" }): ToolCallUpdate {
-  const textContent = extractTextFromToolResult(event.result);
-  return {
-    content: [
-      {
-        content: { text: textContent, type: "text" },
-        type: "content",
-      },
-    ],
-    status: event.isError ? "failed" : "completed",
-    toolCallId: event.toolCallId,
-  };
-}
-
-/**
- * Best-effort extraction of the first text block from a Pi AgentToolResult.
+ * Builds the ACP tool call notifications of one session.
  *
- * Pi tool results and partial results have the shape:
- *   { content: [{ type: "text", text: "..." }], details: {...} }
- *
- * If the value matches this pattern we return the clean text directly;
- * otherwise we fall back to a JSON representation.
+ * Pi reports a tool's name and arguments when it starts but not with its
+ * result, while the result card needs both (an edit's diff comes from its
+ * arguments), so the mapper keeps them until the call ends.
  */
-function extractTextFromToolResult(value: unknown): string {
-  if (!value || typeof value !== "object") {
-    return String(value ?? "");
+export class ToolCallMapper {
+  private readonly calls = new Map<string, { name: string; args: unknown }>();
+
+  constructor(private readonly context: PresentationContext) {}
+
+  start(toolCallId: string, name: string, args: unknown, status: ToolCallStatus): ToolCall {
+    this.calls.set(toolCallId, { name, args });
+    const view = presentToolCall(name, args, this.context);
+    return {
+      toolCallId,
+      title: view.title,
+      kind: view.kind,
+      status,
+      locations: view.locations,
+      content: view.content,
+      rawInput: args,
+    };
   }
 
-  const obj = value as Record<string, unknown>;
-
-  const content = obj.content;
-  if (Array.isArray(content) && content.length > 0) {
-    for (const block of content) {
-      if (
-        block &&
-        typeof block === "object" &&
-        (block as Record<string, unknown>).type === "text"
-      ) {
-        const text = (block as Record<string, unknown>).text;
-        if (typeof text === "string") {
-          return text;
-        }
-      }
-    }
+  /** Returns null when the partial result would not change what the card shows. */
+  progress(
+    toolCallId: string,
+    name: string,
+    args: unknown,
+    partialResult: unknown,
+  ): ToolCallUpdate | null {
+    const content = presentToolProgress(name, args, toOutcome(partialResult, false), this.context);
+    if (content === undefined) return null;
+    return { toolCallId, status: "in_progress", content };
   }
 
-  if (typeof obj.error === "string") {
-    return obj.error;
+  end(toolCallId: string, fallbackName: string, result: unknown, isError: boolean): ToolCallUpdate {
+    const call = this.calls.get(toolCallId) ?? { name: fallbackName, args: undefined };
+    this.calls.delete(toolCallId);
+    const outcome = toOutcome(result, isError);
+    const content = presentToolResult(call.name, call.args, outcome, this.context);
+    const locations = presentResultLocations(call.name, call.args, outcome, this.context);
+    return {
+      toolCallId,
+      status: isError ? "failed" : "completed",
+      ...(content === undefined ? {} : { content }),
+      ...(locations === undefined ? {} : { locations }),
+    };
   }
-
-  return safeJsonStringify(value);
 }
 
-function safeJsonStringify(value: unknown): string {
-  try {
-    return JSON.stringify(value, undefined, 2);
-  } catch {
-    return String(value);
+/**
+ * Normalizes what Pi hands over as a result: an AgentToolResult or a stored
+ * ToolResultMessage (both `{ content, details }`), or a bare value.
+ */
+function toOutcome(result: unknown, isError: boolean): ToolOutcome {
+  if (result && typeof result === "object" && "content" in result) {
+    const { content, details } = result as { content: unknown; details?: unknown };
+    return { content, details, isError };
   }
+  return { content: result, isError };
 }

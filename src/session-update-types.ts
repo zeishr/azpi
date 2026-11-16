@@ -8,4 +8,7 @@ export enum SessionUpdateType {
   AvailableCommandsUpdate = "available_commands_update",
   ToolCall = "tool_call",
   ToolCallUpdate = "tool_call_update",
+  UsageUpdate = "usage_update",
+  CompactionUpdate = "compaction_update",
+  Notice = "notice",
 }

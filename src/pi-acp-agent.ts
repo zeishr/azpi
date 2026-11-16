@@ -39,8 +39,9 @@ import type {
   CreateAgentSessionOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { createAcpProxyTools } from "./client-tool-proxy";
-import { mapSessionEvent, mapStopReason } from "./event-bridge";
+import { SessionEventBridge, buildUsageUpdate, mapStopReason } from "./event-bridge";
 import {
   convertPromptContent,
   deriveSessionName,
@@ -86,6 +87,9 @@ export interface PiAcpAgentOptions {
  */
 export class PiAcpAgent {
   private sessions = new Map<string, AgentSession>();
+  private bridges = new Map<string, SessionEventBridge>();
+  /** Last message of the latest Pi run, which decides the stop reason once it settles. */
+  private lastRunMessages = new Map<string, AgentMessage | undefined>();
   private unsubscribers = new Map<string, () => void>();
   private pendingPrompts = new Map<string, { resolve: (r: PromptResponse) => void }>();
   private abortControllers = new Map<string, AbortController>();
@@ -497,7 +501,7 @@ export class PiAcpAgent {
       const result = await this.options.sessionFactory(cwd);
       const session = result.session;
       const resolvedSessionId = session.sessionId;
-      this.registerSession(resolvedSessionId, session);
+      this.registerSession(resolvedSessionId, session, cwd);
       return { session, sessionId: resolvedSessionId };
     }
 
@@ -524,13 +528,17 @@ export class PiAcpAgent {
       uiContext: createAcpUiBridge(this.client, resolvedSessionId),
     });
 
-    this.registerSession(resolvedSessionId, session);
+    this.registerSession(resolvedSessionId, session, cwd);
 
     return { session, sessionId: resolvedSessionId };
   }
 
-  private registerSession(sessionId: string, session: AgentSession): void {
+  private registerSession(sessionId: string, session: AgentSession, cwd: string): void {
     this.sessions.set(sessionId, session);
+    this.bridges.set(
+      sessionId,
+      new SessionEventBridge({ sessionId, cwd, capabilities: this.clientCapabilities }),
+    );
     if (session.sessionFile) {
       this.sessionResolver.registerSession(sessionId, session.sessionFile);
     }
@@ -559,6 +567,8 @@ export class PiAcpAgent {
     }
 
     this.sessionResolver.unregisterSession(sessionId);
+    this.bridges.delete(sessionId);
+    this.lastRunMessages.delete(sessionId);
     this.commandsAdvertised.delete(sessionId);
     this.startupMessageSent.delete(sessionId);
 
@@ -582,50 +592,73 @@ export class PiAcpAgent {
 
   private onEvent(sessionId: string, event: AgentSessionEvent): void {
     const session = this.sessions.get(sessionId);
-    const configOptions = session ? this.buildConfigOptions(session) : undefined;
-    const notification = mapSessionEvent(event, sessionId, configOptions);
+    // Config options only matter to thinking level changes; building them is not free.
+    const configOptions =
+      session && event.type === "thinking_level_changed"
+        ? this.buildConfigOptions(session)
+        : undefined;
+    const notification = this.bridges.get(sessionId)?.map(event, configOptions);
     if (notification) {
       this.safeNotify(() => this.client.notify("session/update", notification));
     }
 
-    // willRetry means Pi will auto-retry this turn, so the prompt is not done
-    // yet — resolving here would end the ACP turn while the retry still streams.
-    if (event.type === "agent_end" && !event.willRetry) {
-      const lastMessage = event.messages[event.messages.length - 1];
-      const stopReason = mapStopReason(lastMessage);
-
-      // Drain all in-flight session/update notifications BEFORE resolving
-      // the prompt RPC response. The ACP spec requires that all notifications
-      // for a turn be sent before the terminal session/prompt response.
-      // Without this drain, agent_message_chunk frames race past end_turn
-      // while the final text is still streaming.
-      this.notificationDrainGate
-        .then(() =>
-          this.client.notify("session/update", {
-            sessionId,
-            update: {
-              sessionUpdate: SessionUpdateType.SessionInfoUpdate,
-              updatedAt: new Date().toISOString(),
-            },
-          }),
-        )
-        .catch(() => {
-          // Connection may be closing; ignore
-        })
-        .finally(async () => {
-          // Wait for finishRun() to set isStreaming = false before resolving
-          // the prompt promise. Without this, the client can send a new prompt
-          // while the agent is still marked as streaming.
-          if (session) {
-            await session.agent.waitForIdle();
-          }
-          const pending = this.pendingPrompts.get(sessionId);
-          if (pending) {
-            this.pendingPrompts.delete(sessionId);
-            pending.resolve({ stopReason });
-          }
-        });
+    if (event.type === "turn_end" && session) {
+      this.sendUsageUpdate(sessionId, session);
+    } else if (event.type === "agent_end") {
+      this.lastRunMessages.set(sessionId, event.messages[event.messages.length - 1]);
+    } else if (event.type === "agent_settled") {
+      // agent_end may still be followed by a retry, a compaction retry or
+      // queued messages; agent_settled is the point where Pi stops on its own.
+      const stopReason = event.aborted
+        ? "cancelled"
+        : mapStopReason(this.lastRunMessages.get(sessionId));
+      this.settlePrompt(sessionId, session, stopReason);
     }
+  }
+
+  private sendUsageUpdate(sessionId: string, session: AgentSession): void {
+    const update = buildUsageUpdate(session.getContextUsage(), session.getSessionStats().cost);
+    if (update) {
+      this.safeNotify(() => this.client.notify("session/update", { sessionId, update }));
+    }
+  }
+
+  private settlePrompt(
+    sessionId: string,
+    session: AgentSession | undefined,
+    stopReason: PromptResponse["stopReason"],
+  ): void {
+    // Drain all in-flight session/update notifications BEFORE resolving
+    // the prompt RPC response. The ACP spec requires that all notifications
+    // for a turn be sent before the terminal session/prompt response.
+    // Without this drain, agent_message_chunk frames race past end_turn
+    // while the final text is still streaming.
+    this.notificationDrainGate
+      .then(() =>
+        this.client.notify("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: SessionUpdateType.SessionInfoUpdate,
+            updatedAt: new Date().toISOString(),
+          },
+        }),
+      )
+      .catch(() => {
+        // Connection may be closing; ignore
+      })
+      .finally(async () => {
+        // Wait for finishRun() to set isStreaming = false before resolving
+        // the prompt promise. Without this, the client can send a new prompt
+        // while the agent is still marked as streaming.
+        if (session) {
+          await session.agent.waitForIdle();
+        }
+        const pending = this.pendingPrompts.get(sessionId);
+        if (pending) {
+          this.pendingPrompts.delete(sessionId);
+          pending.resolve({ stopReason });
+        }
+      });
   }
 
   private async discoverAndEmitCommands(sessionId: string): Promise<void> {

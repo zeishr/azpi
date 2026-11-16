@@ -96,6 +96,9 @@ function createMockModelRuntime(getAuthResult?: any) {
   const authResult = getAuthResult === undefined ? { auth: { apiKey: "test-key" } } : getAuthResult;
   return {
     getAuth: mock(async () => authResult),
+    // Read by the real ModelRegistry when a test does not inject its own.
+    getModels: () => [],
+    getAvailableSnapshot: () => [],
   } as any;
 }
 
@@ -605,6 +608,7 @@ describe("PiAcpAgent", () => {
       setTimeout(() => {
         for (const sub of subscribers) {
           sub({ type: "agent_end", messages: [{ stopReason: "end_turn" }] });
+          sub({ type: "agent_settled", aborted: false });
         }
       }, 5);
 
@@ -628,6 +632,7 @@ describe("PiAcpAgent", () => {
       setTimeout(() => {
         for (const sub of subscribers) {
           sub({ type: "agent_end", messages: [{ stopReason: "end_turn" }] });
+          sub({ type: "agent_settled", aborted: false });
         }
       }, 5);
 
@@ -653,6 +658,7 @@ describe("PiAcpAgent", () => {
       setTimeout(() => {
         for (const sub of subscribers) {
           sub({ type: "agent_end", messages: [{ stopReason: "end_turn" }] });
+          sub({ type: "agent_settled", aborted: false });
         }
       }, 5);
 
@@ -678,6 +684,7 @@ describe("PiAcpAgent", () => {
       setTimeout(() => {
         for (const sub of subscribers) {
           sub({ type: "agent_end", messages: [{ stopReason: "end_turn" }] });
+          sub({ type: "agent_settled", aborted: false });
         }
       }, 5);
 
@@ -714,6 +721,7 @@ describe("PiAcpAgent", () => {
       setTimeout(() => {
         for (const sub of subscribers) {
           sub({ type: "agent_end", messages: [{ stopReason: "end_turn" }] });
+          sub({ type: "agent_settled", aborted: false });
         }
       }, 5);
 
@@ -747,6 +755,7 @@ describe("PiAcpAgent", () => {
       setTimeout(() => {
         for (const sub of subscribers) {
           sub({ type: "agent_end", messages: [{ stopReason: "end_turn" }] });
+          sub({ type: "agent_settled", aborted: false });
         }
       }, 5);
 
@@ -814,6 +823,7 @@ describe("PiAcpAgent", () => {
       setTimeout(() => {
         for (const sub of subscribers) {
           sub({ type: "agent_end", messages: [{ stopReason: "end_turn" }] });
+          sub({ type: "agent_settled", aborted: false });
         }
       }, 5);
 
@@ -1213,7 +1223,7 @@ describe("error handling", () => {
   });
 });
 
-describe("notification drain on agent_end", () => {
+describe("notification drain on agent_settled", () => {
   it("resolves prompt only after all sessionUpdate notifications flushed", async () => {
     const models = [createMockModel()];
     const mockSession = createMockSession({ model: models[0] });
@@ -1262,7 +1272,7 @@ describe("notification drain on agent_end", () => {
       }),
     );
 
-    // Start prompt — will wait for agent_end to resolve
+    // Start prompt — will wait for agent_settled to resolve
     const promptPromise = agent.prompt(promptReq(newResult.sessionId, "test"));
 
     // Let microtasks flush so sessionUpdate calls are started
@@ -1271,13 +1281,14 @@ describe("notification drain on agent_end", () => {
     // Verify sessionUpdates were started (blocked on deferreds)
     expect(sessionUpdateDeferreds.length).toBe(2);
 
-    // Fire agent_end — should NOT resolve prompt yet because sessionUpdates still pending
+    // Fire the end of the run — should NOT resolve prompt yet because sessionUpdates still pending
     subscribers.forEach((sub) =>
       sub({
         type: "agent_end",
         messages: [{ role: "assistant", stopReason: "end_turn", content: "done" }],
       }),
     );
+    subscribers.forEach((sub) => sub({ type: "agent_settled", aborted: false }));
 
     // Wait a tick — prompt should still be pending
     await new Promise((r) => setTimeout(r, 5));
@@ -1295,7 +1306,7 @@ describe("notification drain on agent_end", () => {
       resolve();
     }
 
-    // agent_end handler also fires session_info_update — resolve that too
+    // agent_settled handler also fires session_info_update — resolve that too
     await new Promise((r) => setTimeout(r, 5));
     for (const resolve of sessionUpdateDeferreds.splice(0)) {
       resolve();
@@ -1399,34 +1410,53 @@ describe("createAgentApp", () => {
   });
 });
 
-describe("agent_end with willRetry", () => {
-  it("keeps the prompt pending until a non-retry agent_end arrives", async () => {
+describe("prompt completion on agent_settled", () => {
+  async function startPrompt() {
     const models = [createMockModel()];
     const mockSession = createMockSession({ model: models[0] });
-    const conn = createMockConnection();
-    const agent = new PiAcpAgent(conn, {
+    const agent = new PiAcpAgent(createMockConnection(), {
       modelRuntime: createMockModelRuntime(),
       modelRegistry: createMockRegistry(models) as any,
       sessionFactory: async () => ({ session: mockSession }),
     });
-
     const newResult = await agent.newSession(newSessionReq());
     const subscribers = (mockSession as any)._subscribers as Array<(event: any) => void>;
     const emit = (event: any) => {
       for (const sub of subscribers) sub(event);
     };
-
     let resolved = false;
-    const promptPromise = agent.prompt(promptReq(newResult.sessionId, "Hello")).then((result) => {
+    const result = agent.prompt(promptReq(newResult.sessionId, "Hello")).then((response) => {
       resolved = true;
-      return result;
+      return response;
     });
+    return { emit, result, isResolved: () => resolved };
+  }
+
+  it("keeps the prompt pending after agent_end, since Pi may still retry", async () => {
+    const { emit, result, isResolved } = await startPrompt();
 
     emit({ type: "agent_end", messages: [{ stopReason: "error" }], willRetry: true });
-    await Bun.sleep(20);
-    expect(resolved).toBe(false);
-
     emit({ type: "agent_end", messages: [{ stopReason: "end_turn" }], willRetry: false });
-    expect(await promptPromise).toEqual({ stopReason: "end_turn" });
+    await Bun.sleep(20);
+    expect(isResolved()).toBe(false);
+
+    emit({ type: "agent_settled", aborted: false });
+    expect(await result).toEqual({ stopReason: "end_turn" });
+  });
+
+  it("takes the stop reason from the last run once settled", async () => {
+    const { emit, result } = await startPrompt();
+
+    emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "length" }] });
+    emit({ type: "agent_settled", aborted: false });
+    expect(await result).toEqual({ stopReason: "max_tokens" });
+  });
+
+  it("reports an aborted run as cancelled", async () => {
+    const { emit, result } = await startPrompt();
+
+    emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
+    emit({ type: "agent_settled", aborted: true });
+    expect(await result).toEqual({ stopReason: "cancelled" });
   });
 });

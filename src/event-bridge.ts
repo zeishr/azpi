@@ -1,132 +1,198 @@
 import type {
+  ClientCapabilities,
+  ContentBlock,
   SessionConfigOption,
   SessionNotification,
+  SessionUpdate,
   StopReason,
-  ContentBlock,
 } from "@agentclientprotocol/sdk";
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEvent, ContextUsage } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { mapToolCallEnd, mapToolCallStart, mapToolCallUpdate } from "./tool-call-mapper";
+import { ToolCallMapper } from "./tool-call-mapper";
 import { SessionUpdateType } from "./session-update-types";
 
+export interface SessionEventBridgeOptions {
+  sessionId: string;
+  /** Session working directory, used to resolve the paths tools receive. */
+  cwd: string;
+  capabilities?: ClientCapabilities;
+}
+
 /**
- * Maps a Pi AgentSessionEvent to an ACP SessionNotification, or null if the event
- * should not produce a notification.
+ * Maps the Pi events of one session to ACP session/update notifications.
+ *
+ * Stateful because some updates span several events: a tool result needs the
+ * arguments seen when the tool started, and a compaction's end must reuse the
+ * id announced at its start.
  */
-export function mapSessionEvent(
-  event: AgentSessionEvent,
-  sessionId: string,
-  configOptions?: SessionConfigOption[],
-): SessionNotification | null {
-  switch (event.type) {
-    case "message_update": {
-      const assistantEvent = event.assistantMessageEvent;
-      if (assistantEvent?.type === "text_delta") {
-        const delta = assistantEvent.delta;
-        if (typeof delta !== "string" || delta.length === 0) {
-          return null;
-        }
+export class SessionEventBridge {
+  private readonly tools: ToolCallMapper;
+  private readonly sendsNotices: boolean;
+  private readonly sendsCompactions: boolean;
+  private compactionCount = 0;
+  private currentCompactionId: string | undefined;
+
+  constructor(private readonly options: SessionEventBridgeOptions) {
+    this.tools = new ToolCallMapper({ cwd: options.cwd, live: true });
+    // Both updates are opt-in: ACP forbids sending them to a client that did not ask.
+    this.sendsNotices = Boolean(options.capabilities?.session?.notices);
+    this.sendsCompactions = Boolean(options.capabilities?.session?.compaction);
+  }
+
+  map(event: AgentSessionEvent, configOptions?: SessionConfigOption[]): SessionNotification | null {
+    const update = this.mapUpdate(event, configOptions);
+    return update ? { sessionId: this.options.sessionId, update } : null;
+  }
+
+  private mapUpdate(
+    event: AgentSessionEvent,
+    configOptions?: SessionConfigOption[],
+  ): SessionUpdate | null {
+    switch (event.type) {
+      case "message_update":
+        return mapAssistantDelta(event.assistantMessageEvent);
+
+      case "tool_execution_start":
         return {
-          sessionId,
-          update: {
-            content: { text: delta, type: "text" },
-            sessionUpdate: SessionUpdateType.AgentMessageChunk,
-          },
-        };
-      } else if (assistantEvent?.type === "thinking_delta") {
-        const delta = assistantEvent.delta;
-        if (typeof delta !== "string" || delta.length === 0) {
-          return null;
-        }
-        return {
-          sessionId,
-          update: {
-            content: { text: delta, type: "text" },
-            sessionUpdate: SessionUpdateType.AgentThoughtChunk,
-          },
-        };
-      }
-      return null;
-    }
-
-    case "message_start": {
-      // Optional: could emit a plan marker or no-op
-      return null;
-    }
-
-    case "message_end": {
-      // No notification needed — handled by agent_end
-      return null;
-    }
-
-    case "tool_execution_start": {
-      return {
-        sessionId,
-        update: {
           sessionUpdate: SessionUpdateType.ToolCall,
-          ...mapToolCallStart(event),
-        },
-      };
-    }
+          ...this.tools.start(event.toolCallId, event.toolName, event.args, "in_progress"),
+        };
 
-    case "tool_execution_update": {
-      return {
-        sessionId,
-        update: {
+      case "tool_execution_update": {
+        const update = this.tools.progress(
+          event.toolCallId,
+          event.toolName,
+          event.args,
+          event.partialResult,
+        );
+        return update && { sessionUpdate: SessionUpdateType.ToolCallUpdate, ...update };
+      }
+
+      case "tool_execution_end":
+        return {
           sessionUpdate: SessionUpdateType.ToolCallUpdate,
-          ...mapToolCallUpdate(event),
-        },
-      };
-    }
+          ...this.tools.end(event.toolCallId, event.toolName, event.result, event.isError),
+        };
 
-    case "tool_execution_end": {
-      return {
-        sessionId,
-        update: {
-          sessionUpdate: SessionUpdateType.ToolCallUpdate,
-          ...mapToolCallEnd(event),
-        },
-      };
-    }
+      case "session_info_changed":
+        return { sessionUpdate: SessionUpdateType.SessionInfoUpdate, title: event.name ?? null };
 
-    case "session_info_changed": {
-      return {
-        sessionId,
-        update: {
-          sessionUpdate: SessionUpdateType.SessionInfoUpdate,
-          title: event.name ?? null,
-        },
-      };
-    }
+      case "thinking_level_changed":
+        return configOptions
+          ? { sessionUpdate: SessionUpdateType.ConfigOptionUpdate, configOptions }
+          : null;
 
-    case "thinking_level_changed": {
-      if (!configOptions) return null;
-      return {
-        sessionId,
-        update: {
-          sessionUpdate: SessionUpdateType.ConfigOptionUpdate,
-          configOptions,
-        },
-      };
-    }
+      case "compaction_start":
+        return this.compactionStarted();
 
-    case "agent_start":
-    case "agent_end":
-    case "turn_start":
-    case "turn_end":
-    case "queue_update":
-    case "compaction_start":
-    case "compaction_end":
-    case "auto_retry_start":
-    case "auto_retry_end": {
-      // These events don't map to ACP notifications in the MVP
-      return null;
-    }
+      case "compaction_end":
+        return this.compactionEnded(event);
 
-    default: {
-      return null;
+      case "auto_retry_start":
+        return this.notice(
+          "warning",
+          `Retrying after an error (attempt ${event.attempt} of ${event.maxAttempts})`,
+          event.errorMessage,
+        );
+
+      case "auto_retry_end":
+        return event.success
+          ? null
+          : this.notice("error", `Gave up after ${event.attempt} attempts`, event.finalError);
+
+      default:
+        return null;
     }
   }
+
+  private compactionStarted(): SessionUpdate | null {
+    if (!this.sendsCompactions) return null;
+    this.compactionCount += 1;
+    this.currentCompactionId = `compaction-${this.compactionCount}`;
+    return {
+      sessionUpdate: SessionUpdateType.CompactionUpdate,
+      compactionId: this.currentCompactionId,
+      status: "in_progress",
+    };
+  }
+
+  private compactionEnded(
+    event: AgentSessionEvent & { type: "compaction_end" },
+  ): SessionUpdate | null {
+    const compactionId = this.currentCompactionId;
+    this.currentCompactionId = undefined;
+    if (!this.sendsCompactions || !compactionId) return null;
+
+    if (event.aborted) {
+      return {
+        sessionUpdate: SessionUpdateType.CompactionUpdate,
+        compactionId,
+        status: "cancelled",
+      };
+    }
+    if (!event.result) {
+      return {
+        sessionUpdate: SessionUpdateType.CompactionUpdate,
+        compactionId,
+        status: "failed",
+        error: event.errorMessage ?? "Compaction produced no result",
+      };
+    }
+    return {
+      sessionUpdate: SessionUpdateType.CompactionUpdate,
+      compactionId,
+      status: "completed",
+      summary: [{ type: "text", text: event.result.summary }],
+    };
+  }
+
+  private notice(
+    severity: "warning" | "error",
+    title: string,
+    description: string | undefined,
+  ): SessionUpdate | null {
+    if (!this.sendsNotices) return null;
+    return {
+      sessionUpdate: SessionUpdateType.Notice,
+      severity,
+      title,
+      ...(description ? { description } : {}),
+    };
+  }
+}
+
+function mapAssistantDelta(
+  assistantEvent: (AgentSessionEvent & { type: "message_update" })["assistantMessageEvent"],
+): SessionUpdate | null {
+  if (assistantEvent?.type !== "text_delta" && assistantEvent?.type !== "thinking_delta") {
+    return null;
+  }
+  const delta = assistantEvent.delta;
+  if (typeof delta !== "string" || delta.length === 0) return null;
+  return {
+    content: { text: delta, type: "text" },
+    sessionUpdate:
+      assistantEvent.type === "text_delta"
+        ? SessionUpdateType.AgentMessageChunk
+        : SessionUpdateType.AgentThoughtChunk,
+  };
+}
+
+/**
+ * Builds the context window and cost update, or null while Pi does not know
+ * how full the context is (right after a compaction, before the next reply).
+ */
+export function buildUsageUpdate(
+  usage: ContextUsage | undefined,
+  totalCost: number,
+): SessionUpdate | null {
+  if (!usage || usage.tokens === null) return null;
+  return {
+    sessionUpdate: SessionUpdateType.UsageUpdate,
+    used: Math.max(0, Math.round(usage.tokens)),
+    size: usage.contextWindow,
+    cost: { amount: totalCost, currency: "USD" },
+  };
 }
 
 /**
@@ -150,7 +216,7 @@ export function extractMessageText(message: AgentMessage | undefined): string | 
 }
 
 /**
- * Maps a Pi agent_end event to an ACP StopReason.
+ * Maps the last message of a Pi run to an ACP StopReason.
  */
 export function mapStopReason(message: AgentMessage | undefined): StopReason {
   if (!message || message.role !== "assistant") {
