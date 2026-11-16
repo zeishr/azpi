@@ -6,7 +6,8 @@ import type {
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { resolve as _resolve } from "path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve as _resolve } from "node:path";
 
 const BASH_POLL_INTERVAL = 250;
 
@@ -32,10 +33,15 @@ const editParams = Type.Object({
   ),
 });
 
+// Same contract as Pi's native bash tool, so prompts written for Pi still hold.
 const bashParams = Type.Object({
-  command: Type.String({ description: "Command to execute" }),
-  timeout: Type.Optional(Type.Number({ description: "Timeout in milliseconds" })),
+  command: Type.String({ description: "Shell command to execute" }),
+  timeout: Type.Optional(
+    Type.Number({ description: "Timeout in seconds (optional, no default timeout)" }),
+  ),
 });
+
+const MS_PER_SECOND = 1000;
 
 /** 1-based indexing for line numbers in Pi/ACP. */
 const ONE_BASED_LINE_OFFSET = 1;
@@ -94,6 +100,36 @@ function resolvePath(cwd: string, path: string): string {
   return _resolve(cwd, path);
 }
 
+/**
+ * Reads through the client so unsaved editor buffers win, and falls back to
+ * the disk when the client refuses the path: Zed only serves files of the
+ * open project, while Pi may read anywhere.
+ */
+async function readText(client: AgentContext, sessionId: string, path: string): Promise<string> {
+  try {
+    const response = await client.request("fs/read_text_file", { sessionId, path });
+    return response.content;
+  } catch {
+    // The local error names the path and the cause, unlike the client's.
+    return readFile(path, "utf8");
+  }
+}
+
+/** Writes through the client so it can track and review the change, with the same fallback as readText. */
+async function writeText(
+  client: AgentContext,
+  sessionId: string,
+  path: string,
+  content: string,
+): Promise<void> {
+  try {
+    await client.request("fs/write_text_file", { sessionId, path, content });
+  } catch {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, content, "utf8");
+  }
+}
+
 /** Apply offset/limit/truncation to raw file content, matching Pi's semantics. */
 function applyOffsetLimit(content: string, offset?: number, limit?: number): string {
   const lines = content.split("\n");
@@ -118,13 +154,11 @@ function createReadProxy(client: AgentContext, sessionId: string, cwd: string): 
     parameters: readParams,
     execute: async (_toolCallId, params) => {
       const absolutePath = resolvePath(cwd, params.path);
-
-      const response = await client.request("fs/read_text_file", {
-        sessionId,
-        path: absolutePath,
-      });
-
-      const content = applyOffsetLimit(response.content, params.offset, params.limit);
+      const content = applyOffsetLimit(
+        await readText(client, sessionId, absolutePath),
+        params.offset,
+        params.limit,
+      );
 
       return {
         content: [{ type: "text" as const, text: content }],
@@ -142,12 +176,7 @@ function createWriteProxy(client: AgentContext, sessionId: string, cwd: string):
     parameters: writeParams,
     execute: async (_toolCallId, params) => {
       const absolutePath = resolvePath(cwd, params.path);
-
-      await client.request("fs/write_text_file", {
-        sessionId,
-        path: absolutePath,
-        content: params.content,
-      });
+      await writeText(client, sessionId, absolutePath, params.content);
 
       return {
         content: [
@@ -171,11 +200,7 @@ function createEditProxy(client: AgentContext, sessionId: string, cwd: string): 
     execute: async (_toolCallId, params) => {
       const absolutePath = resolvePath(cwd, params.path);
 
-      const readResponse = await client.request("fs/read_text_file", {
-        sessionId,
-        path: absolutePath,
-      });
-      let content = readResponse.content;
+      let content = await readText(client, sessionId, absolutePath);
 
       for (const edit of params.edits) {
         const index = content.indexOf(edit.oldText);
@@ -189,11 +214,7 @@ function createEditProxy(client: AgentContext, sessionId: string, cwd: string): 
           content.slice(0, index) + edit.newText + content.slice(index + edit.oldText.length);
       }
 
-      await client.request("fs/write_text_file", {
-        sessionId,
-        path: absolutePath,
-        content,
-      });
+      await writeText(client, sessionId, absolutePath, content);
 
       return {
         content: [
@@ -214,7 +235,7 @@ function createBashProxy(client: AgentContext, sessionId: string, cwd: string): 
     label: "Bash",
     description: "Run a shell command. Returns output and exit code.",
     parameters: bashParams,
-    execute: async (_toolCallId, params, signal, onUpdate) => {
+    execute: async (toolCallId, params, signal, onUpdate) => {
       const { terminalId } = await client.request("terminal/create", {
         sessionId,
         command: params.command,
@@ -222,8 +243,21 @@ function createBashProxy(client: AgentContext, sessionId: string, cwd: string): 
       });
       const terminal = { sessionId, terminalId };
       const release = () => client.request("terminal/release", terminal);
+      const timeoutMs = params.timeout === undefined ? undefined : params.timeout * MS_PER_SECOND;
 
       try {
+        // Embedded right away, as ACP only accepts it before terminal/release.
+        // Carrying terminalId in details tells the event bridge to leave this
+        // content alone instead of replacing it with plain text output.
+        await client.notify("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            content: [{ type: "terminal", terminalId }],
+          },
+        });
+
         let accumulated = "";
         const startTime = Date.now();
 
@@ -234,11 +268,11 @@ function createBashProxy(client: AgentContext, sessionId: string, cwd: string): 
             await release();
             return {
               content: [{ type: "text" as const, text: accumulated || "Command cancelled" }],
-              details: { cancelled: true, truncated: false },
+              details: { cancelled: true, truncated: false, terminalId },
             };
           }
 
-          if (params.timeout && Date.now() - startTime > params.timeout) {
+          if (timeoutMs && Date.now() - startTime > timeoutMs) {
             await client.request("terminal/kill", terminal);
 
             const finalOutput: TerminalOutputResponse = await client.request(
@@ -250,11 +284,19 @@ function createBashProxy(client: AgentContext, sessionId: string, cwd: string): 
               content: [
                 {
                   type: "text" as const,
-                  text: `Command timed out after ${params.timeout}ms.
-${finalOutput.output}`,
+                  text: appendStatus(
+                    finalOutput.output,
+                    `Command timed out after ${params.timeout} seconds`,
+                  ),
                 },
               ],
-              details: { exitCode: null, timedOut: true, truncated: finalOutput.truncated },
+              isError: true,
+              details: {
+                exitCode: null,
+                timedOut: true,
+                truncated: finalOutput.truncated,
+                terminalId,
+              },
             };
           }
 
@@ -264,7 +306,7 @@ ${finalOutput.output}`,
 
             onUpdate?.({
               content: [{ type: "text" as const, text: accumulated }],
-              details: { truncated: output.truncated },
+              details: { truncated: output.truncated, terminalId },
             });
           }
 
@@ -273,11 +315,22 @@ ${finalOutput.output}`,
 
             await release();
 
+            // Like Pi's native bash: a failing command is an error result, not a success.
             return {
-              content: [{ type: "text" as const, text: accumulated }],
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    exitCode === 0
+                      ? accumulated
+                      : appendStatus(accumulated, `Command exited with code ${exitCode}`),
+                },
+              ],
+              isError: exitCode !== 0,
               details: {
                 exitCode,
                 truncated: output.truncated,
+                terminalId,
               },
             };
           }
@@ -295,6 +348,11 @@ ${finalOutput.output}`,
       }
     },
   });
+}
+
+/** Appends a status line the way Pi's native bash does. */
+function appendStatus(output: string, status: string): string {
+  return output ? `${output}\n\n${status}` : status;
 }
 
 /** Sleep for ms, aborting early if the signal fires. */

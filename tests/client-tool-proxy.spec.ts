@@ -1,6 +1,24 @@
 import { describe, expect, it, mock } from "bun:test";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createAcpProxyTools } from "../src/client-tool-proxy";
 import { mockClient } from "./mock-client";
+
+/** Stands in for Zed refusing a path outside its project. */
+const refuse = async () => {
+  throw new Error("Resource not found");
+};
+
+function proxyTool(conn: ReturnType<typeof mockClient>, name: string, cwd = "/") {
+  const tools = createAcpProxyTools({
+    client: conn,
+    sessionId: "test-session-id",
+    capabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
+    cwd,
+  });
+  return tools.find((t) => t.name === name)!;
+}
 
 /** Mock client whose terminal/output responses come from `output`. */
 function mockTerminalClient(output: (params: any) => any) {
@@ -454,7 +472,7 @@ describe("bash proxy", () => {
     });
     const bashTool = tools.find((t) => t.name === "bash")!;
 
-    // Use a very short timeout (1ms) to trigger timeout immediately
+    // Pi's bash timeout is in seconds: this one fires after about a second.
     const result = await bashTool.execute(
       "tc-1",
       { command: "sleep 100", timeout: 1 },
@@ -465,7 +483,57 @@ describe("bash proxy", () => {
 
     expect(conn.method("terminal/kill")).toHaveBeenCalled();
     expect(conn.method("terminal/release")).toHaveBeenCalled();
-    expect((result.content[0] as any).text).toContain("timed out");
+    expect((result.content[0] as any).text).toContain("timed out after 1 seconds");
+    expect(result.isError).toBe(true);
+  });
+
+  it("embeds the terminal in the tool call before releasing it", async () => {
+    const conn = mockTerminalClient(async () => ({
+      output: "ok",
+      truncated: false,
+      exitStatus: { exitCode: 0, signal: null },
+    }));
+
+    const result = await proxyTool(conn, "bash").execute(
+      "tc-1",
+      { command: "true" },
+      undefined,
+      undefined,
+      {} as any,
+    );
+
+    expect(conn.sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "test-session-id",
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tc-1",
+        content: [{ type: "terminal", terminalId: "term-1" }],
+      },
+    });
+    // ACP ignores a terminal added to a tool call after terminal/release.
+    const embedOrder = conn.sessionUpdate.mock.invocationCallOrder[0]!;
+    const releaseOrder = conn.method("terminal/release").mock.invocationCallOrder[0]!;
+    expect(embedOrder).toBeLessThan(releaseOrder);
+    expect(result.details).toMatchObject({ terminalId: "term-1", exitCode: 0 });
+  });
+
+  it("reports a non-zero exit code as an error, like Pi's native bash", async () => {
+    const conn = mockTerminalClient(async () => ({
+      output: "boom",
+      truncated: false,
+      exitStatus: { exitCode: 2, signal: null },
+    }));
+
+    const result = await proxyTool(conn, "bash").execute(
+      "tc-1",
+      { command: "false" },
+      undefined,
+      undefined,
+      {} as any,
+    );
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toBe("boom\n\nCommand exited with code 2");
   });
 
   it("releases terminal on error", async () => {
@@ -486,5 +554,68 @@ describe("bash proxy", () => {
     ).rejects.toThrow("connection lost");
 
     expect(conn.method("terminal/release")).toHaveBeenCalled();
+  });
+});
+
+describe("disk fallback when the client refuses a path", () => {
+  it("reads from disk", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "azpi-"));
+    writeFileSync(join(dir, "outside.txt"), "a\nb\nc");
+    const conn = mockClient({ "fs/read_text_file": refuse });
+
+    const result = await proxyTool(conn, "read", dir).execute(
+      "tc-1",
+      { path: "outside.txt", offset: 2 },
+      undefined,
+      undefined,
+      {} as any,
+    );
+
+    expect((result.content[0] as any).text).toBe("b\nc");
+  });
+
+  it("reports the disk error, which names the path, when the file is missing", async () => {
+    const conn = mockClient({ "fs/read_text_file": refuse });
+
+    await expect(
+      proxyTool(conn, "read").execute(
+        "tc-1",
+        { path: "/nonexistent/azpi-missing.txt" },
+        undefined,
+        undefined,
+        {} as any,
+      ),
+    ).rejects.toThrow("/nonexistent/azpi-missing.txt");
+  });
+
+  it("writes to disk, creating missing directories", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "azpi-"));
+    const conn = mockClient({ "fs/write_text_file": refuse });
+
+    await proxyTool(conn, "write", dir).execute(
+      "tc-1",
+      { path: "nested/new.txt", content: "hello" },
+      undefined,
+      undefined,
+      {} as any,
+    );
+
+    expect(readFileSync(join(dir, "nested/new.txt"), "utf8")).toBe("hello");
+  });
+
+  it("edits on disk", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "azpi-"));
+    writeFileSync(join(dir, "a.txt"), "hello world");
+    const conn = mockClient({ "fs/read_text_file": refuse, "fs/write_text_file": refuse });
+
+    await proxyTool(conn, "edit", dir).execute(
+      "tc-1",
+      { path: "a.txt", edits: [{ oldText: "world", newText: "zed" }] },
+      undefined,
+      undefined,
+      {} as any,
+    );
+
+    expect(readFileSync(join(dir, "a.txt"), "utf8")).toBe("hello zed");
   });
 });
