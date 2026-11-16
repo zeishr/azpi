@@ -143,7 +143,7 @@ describe("event-bridge", () => {
     it("maps tool_execution_update to tool_call_update", () => {
       const event = {
         args: { command: "ls" },
-        partialResult: { output: "file.txt" },
+        partialResult: { content: [{ type: "text", text: "file.txt" }] },
         toolCallId: "tc-1",
         toolName: "bash",
         type: "tool_execution_update" as const,
@@ -152,6 +152,21 @@ describe("event-bridge", () => {
       expect(result).not.toBeNull();
       expect(result!.update.sessionUpdate).toBe("tool_call_update");
       expect((result!.update as any).status).toBe("in_progress");
+      expect((result!.update as any).content[0].content.text).toBe("```console\nfile.txt\n```");
+    });
+
+    it("skips the empty update Pi opens a bash call with", () => {
+      const update = mapOne(
+        bridge(),
+        asEvent({
+          type: "tool_execution_update",
+          toolCallId: "tc-1",
+          toolName: "bash",
+          args: { command: "ls" },
+          partialResult: { content: [], details: undefined },
+        }),
+      );
+      expect(update).toBeNull();
     });
 
     it("maps successful tool_execution_end to tool_call_update with completed", () => {

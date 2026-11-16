@@ -163,6 +163,24 @@ describe("presentToolResult", () => {
     expect(presentToolResult("edit", {}, outcome, ctx)).toEqual([textBlock("oldText not found")]);
   });
 
+  it("keeps a terminal-backed bash card on failure: the client shows the exit status", () => {
+    const outcome = {
+      ...text("boom\n\nCommand exited with code 3"),
+      details: { terminalId: "t1" },
+      isError: true,
+    };
+    expect(presentToolResult("bash", {}, outcome, ctx)).toBeUndefined();
+  });
+
+  it("shows the error of a failed read, grep, find or ls", () => {
+    const outcome = { ...text("ENOENT: /x"), isError: true };
+    for (const name of ["read", "grep", "find", "ls"]) {
+      expect(presentToolResult(name, { path: "/x" }, outcome, ctx)).toEqual([
+        textBlock("ENOENT: /x"),
+      ]);
+    }
+  });
+
   it("surfaces the error of a tool whose presenter shows nothing on failure", () => {
     const outcome = { ...text("ENOENT"), isError: true };
     expect(presentToolResult("read", { path: "a.ts" }, outcome, ctx)).toEqual([

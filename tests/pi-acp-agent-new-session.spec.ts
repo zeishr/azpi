@@ -4,7 +4,11 @@ import { mockClient } from "./mock-client";
 
 let capturedCreateAgentSessionOptions: any;
 
+// The tool factories stay real: AZPi builds its client tools from Pi's own.
+const realPi = await import("@earendil-works/pi-coding-agent");
+
 mock.module("@earendil-works/pi-coding-agent", () => ({
+  ...realPi,
   VERSION: "0.0.0-test",
   ModelRuntime: {
     create: async () => ({}),
@@ -56,7 +60,6 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
       },
     };
   }),
-  defineTool: (tool: any) => tool,
 }));
 
 const { PiAcpAgent } = await import("../src/pi-acp-agent");
@@ -100,7 +103,11 @@ describe("PiAcpAgent newSession without sessionFactory", () => {
     );
     expect(bashTool).toBeDefined();
 
-    await bashTool.execute("tc-1", { command: "echo hello" }, undefined, undefined, {} as any);
+    const toolContext = {
+      cwd: "/test",
+      sessionManager: { getSessionId: () => "real-session-id", getSessionFile: () => undefined },
+    };
+    await bashTool.execute("tc-1", { command: "echo hello" }, undefined, undefined, toolContext);
 
     expect(conn.method("terminal/create")).toHaveBeenCalledWith(
       expect.objectContaining({

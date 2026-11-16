@@ -2,508 +2,227 @@ import { describe, expect, it, mock } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAcpProxyTools } from "../src/client-tool-proxy";
+import {
+  createAcpProxyTools,
+  exitCodeOf,
+  outputForwarder,
+  piVariables,
+} from "../src/client-tool-proxy";
 import { mockClient } from "./mock-client";
+
+const SESSION_ID = "test-session-id";
 
 /** Stands in for Zed refusing a path outside its project. */
 const refuse = async () => {
   throw new Error("Resource not found");
 };
 
-function proxyTool(conn: ReturnType<typeof mockClient>, name: string, cwd = "/") {
+/** The slice of Pi's tool context the built-in tools read. */
+const toolContext = {
+  cwd: "/",
+  model: { provider: "anthropic", id: "claude", input: ["text", "image"] },
+  thinkingLevel: "high",
+  sessionManager: { getSessionId: () => "pi-session", getSessionFile: () => "/tmp/s.jsonl" },
+} as any;
+
+function tempDir(): string {
+  return mkdtempSync(join(tmpdir(), "azpi-"));
+}
+
+function tool(conn: ReturnType<typeof mockClient>, name: string, cwd = "/") {
   const tools = createAcpProxyTools({
     client: conn,
-    sessionId: "test-session-id",
+    sessionId: SESSION_ID,
     capabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: true },
     cwd,
   });
   return tools.find((t) => t.name === name)!;
 }
 
-/** Mock client whose terminal/output responses come from `output`. */
-function mockTerminalClient(output: (params: any) => any) {
-  return mockClient({
-    "terminal/create": async () => ({ terminalId: "term-1" }),
-    "terminal/output": output,
-  });
+function run(conn: ReturnType<typeof mockClient>, name: string, params: object, cwd = "/") {
+  // Pi's tools resolve paths against the context's cwd, the session's in practice.
+  const context = { ...toolContext, cwd };
+  return tool(conn, name, cwd).execute("tc-1", params, undefined, undefined, context);
 }
 
+const textOf = (result: { content: any[] }) => result.content[0]?.text as string;
+
 describe("createAcpProxyTools", () => {
-  const defaultCwd = "/home/user/project";
-  const sessionId = "test-session-id";
-
-  it("returns empty array when no capabilities are advertised", () => {
-    const tools = createAcpProxyTools({
+  const create = (capabilities: object) =>
+    createAcpProxyTools({
       client: mockClient(),
-      sessionId,
-      capabilities: {},
-      cwd: defaultCwd,
-    });
-    expect(tools).toHaveLength(0);
+      sessionId: SESSION_ID,
+      capabilities,
+      cwd: "/",
+    }).map((t) => t.name);
+
+  it("keeps Pi's local tools when the client advertises nothing", () => {
+    expect(create({})).toEqual([]);
   });
 
-  it("creates read proxy when client advertises fs.readTextFile", () => {
-    const tools = createAcpProxyTools({
-      client: mockClient(),
-      sessionId,
-      capabilities: { fs: { readTextFile: true } },
-      cwd: defaultCwd,
-    });
-    const toolNames = tools.map((t) => t.name);
-    expect(toolNames).toContain("read");
-    expect(toolNames).not.toContain("write");
-    expect(toolNames).not.toContain("edit");
-    expect(toolNames).not.toContain("bash");
+  it("replaces each tool the client can serve", () => {
+    expect(create({ fs: { readTextFile: true } })).toEqual(["read"]);
+    expect(create({ fs: { writeTextFile: true } })).toEqual(["write"]);
+    expect(create({ terminal: true })).toEqual(["bash"]);
+    expect(create({ fs: { readTextFile: true, writeTextFile: true }, terminal: true })).toEqual([
+      "read",
+      "write",
+      "edit",
+      "bash",
+    ]);
   });
 
-  it("creates write proxy when client advertises fs.writeTextFile", () => {
-    const tools = createAcpProxyTools({
-      client: mockClient(),
-      sessionId,
-      capabilities: { fs: { writeTextFile: true } },
-      cwd: defaultCwd,
-    });
-    const toolNames = tools.map((t) => t.name);
-    expect(toolNames).toContain("write");
-    expect(toolNames).not.toContain("read");
-    expect(toolNames).not.toContain("edit");
-    expect(toolNames).not.toContain("bash");
-  });
-
-  it("creates edit proxy only when both read + write are advertised", () => {
-    const tools = createAcpProxyTools({
-      client: mockClient(),
-      sessionId,
-      capabilities: { fs: { readTextFile: true, writeTextFile: true } },
-      cwd: defaultCwd,
-    });
-    const toolNames = tools.map((t) => t.name);
-    expect(toolNames).toContain("read");
-    expect(toolNames).toContain("write");
-    expect(toolNames).toContain("edit");
-    expect(toolNames).not.toContain("bash");
-  });
-
-  it("creates bash proxy when client advertises terminal", () => {
-    const tools = createAcpProxyTools({
-      client: mockClient(),
-      sessionId,
-      capabilities: { terminal: true },
-      cwd: defaultCwd,
-    });
-    const toolNames = tools.map((t) => t.name);
-    expect(toolNames).toContain("bash");
-    expect(toolNames).not.toContain("read");
-    expect(toolNames).not.toContain("write");
-    expect(toolNames).not.toContain("edit");
-  });
-
-  it("creates all proxies when full capabilities advertised", () => {
-    const tools = createAcpProxyTools({
-      client: mockClient(),
-      sessionId,
-      capabilities: {
-        fs: { readTextFile: true, writeTextFile: true },
-        terminal: true,
-      },
-      cwd: defaultCwd,
-    });
-    const toolNames = tools.map((t) => t.name);
-    expect(toolNames).toContain("read");
-    expect(toolNames).toContain("write");
-    expect(toolNames).toContain("edit");
-    expect(toolNames).toContain("bash");
-    expect(tools.length).toBe(4);
+  it("keeps Pi's own descriptions and parameters", () => {
+    const bash = tool(mockClient(), "bash");
+    expect(bash.description).toContain("timeout in seconds");
+    expect(Object.keys((bash.parameters as any).properties)).toEqual(["command", "timeout"]);
   });
 });
 
-describe("read proxy", () => {
-  const cwd = "/home/user/project";
-  const sessionId = "test-session-id";
+describe("read", () => {
+  it("reads through the client, which sees unsaved buffers", async () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "a.txt"), "on disk");
+    const conn = mockClient({ "fs/read_text_file": async () => ({ content: "in the editor" }) });
 
-  it("reads file content and applies offset/limit", async () => {
-    const conn = mockClient({
-      "fs/read_text_file": mock().mockResolvedValue({
-        content: "line1\nline2\nline3\nline4\nline5",
-      }),
-    });
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { fs: { readTextFile: true } },
-      cwd,
-    });
-    const readTool = tools.find((t) => t.name === "read")!;
+    const result = await run(conn, "read", { path: "a.txt" }, dir);
 
-    // Execute with offset (1-based) and limit
-    const result = await readTool.execute(
-      "tc-1",
-      { path: "test.txt", offset: 2, limit: 3 },
-      undefined,
-      undefined,
-      {} as any,
-    );
-
-    expect(result.content[0]).toMatchObject({
-      type: "text",
-      text: "line2\nline3\nline4",
-    });
-  });
-
-  it("resolves relative paths against cwd", async () => {
-    const conn = mockClient({
-      "fs/read_text_file": mock().mockResolvedValue({ content: "hello" }),
-    });
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { fs: { readTextFile: true } },
-      cwd,
-    });
-    const readTool = tools.find((t) => t.name === "read")!;
-
-    await readTool.execute("tc-1", { path: "sub/file.txt" }, undefined, undefined, {} as any);
-
-    expect(conn.method("fs/read_text_file")).toHaveBeenCalledWith(
-      expect.objectContaining({ path: "/home/user/project/sub/file.txt" }),
-    );
-  });
-
-  it("passes absolute paths as-is", async () => {
-    const conn = mockClient({
-      "fs/read_text_file": mock().mockResolvedValue({ content: "hello" }),
-    });
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { fs: { readTextFile: true } },
-      cwd,
-    });
-    const readTool = tools.find((t) => t.name === "read")!;
-
-    await readTool.execute("tc-1", { path: "/tmp/file.txt" }, undefined, undefined, {} as any);
-
-    expect(conn.method("fs/read_text_file")).toHaveBeenCalledWith(
-      expect.objectContaining({ path: "/tmp/file.txt" }),
-    );
-  });
-
-  it("handles files with fewer lines than offset", async () => {
-    const conn = mockClient({
-      "fs/read_text_file": mock().mockResolvedValue({ content: "line1\nline2" }),
-    });
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { fs: { readTextFile: true } },
-      cwd,
-    });
-    const readTool = tools.find((t) => t.name === "read")!;
-
-    const result = await readTool.execute(
-      "tc-1",
-      { path: "test.txt", offset: 10 },
-      undefined,
-      undefined,
-      {} as any,
-    );
-
-    expect(result.content[0]).toMatchObject({ type: "text", text: "" });
-  });
-});
-
-describe("write proxy", () => {
-  const cwd = "/home/user/project";
-  const sessionId = "test-session-id";
-
-  it("writes content to file and returns success message", async () => {
-    const conn = mockClient({
-      "fs/write_text_file": mock().mockResolvedValue({}),
-    });
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { fs: { writeTextFile: true } },
-      cwd,
-    });
-    const writeTool = tools.find((t) => t.name === "write")!;
-
-    const result = await writeTool.execute(
-      "tc-1",
-      { path: "out.txt", content: "hello world" },
-      undefined,
-      undefined,
-      {} as any,
-    );
-
-    expect(conn.method("fs/write_text_file")).toHaveBeenCalledWith({
-      sessionId,
-      path: "/home/user/project/out.txt",
-      content: "hello world",
-    });
-
-    expect(result.content[0]).toMatchObject({
-      type: "text",
-    });
-    expect((result.content[0] as any).text).toContain("Successfully wrote");
-  });
-});
-
-describe("edit proxy", () => {
-  const cwd = "/home/user/project";
-  const sessionId = "test-session-id";
-
-  it("reads, edits, and writes the file", async () => {
-    const conn = mockClient({
-      "fs/read_text_file": mock().mockResolvedValue({ content: "hello old world" }),
-      "fs/write_text_file": mock().mockResolvedValue({}),
-    });
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { fs: { readTextFile: true, writeTextFile: true } },
-      cwd,
-    });
-    const editTool = tools.find((t) => t.name === "edit")!;
-
-    const result = await editTool.execute(
-      "tc-1",
-      { path: "test.txt", edits: [{ oldText: "old", newText: "new" }] },
-      undefined,
-      undefined,
-      {} as any,
-    );
-
+    expect(textOf(result)).toBe("in the editor");
     expect(conn.method("fs/read_text_file")).toHaveBeenCalledWith({
-      sessionId,
-      path: "/home/user/project/test.txt",
+      sessionId: SESSION_ID,
+      path: join(dir, "a.txt"),
     });
-
-    expect(conn.method("fs/write_text_file")).toHaveBeenCalledWith({
-      sessionId,
-      path: "/home/user/project/test.txt",
-      content: "hello new world",
-    });
-
-    expect(result.content[0]).toMatchObject({ type: "text" });
   });
 
-  it("throws if oldText not found", async () => {
-    const conn = mockClient({
-      "fs/read_text_file": mock().mockResolvedValue({ content: "hello world" }),
-      "fs/write_text_file": mock().mockResolvedValue({}),
-    });
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { fs: { readTextFile: true, writeTextFile: true } },
-      cwd,
-    });
-    const editTool = tools.find((t) => t.name === "edit")!;
+  it("falls back to the disk when the client refuses the path", async () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "a.txt"), "a\nb\nc");
+    const conn = mockClient({ "fs/read_text_file": refuse });
 
-    await expect(
-      editTool.execute(
-        "tc-1",
-        { path: "test.txt", edits: [{ oldText: "nonexistent", newText: "replacement" }] },
-        undefined,
-        undefined,
-        {} as any,
-      ),
-    ).rejects.toThrow("could not find exact text to replace");
+    expect(textOf(await run(conn, "read", { path: "a.txt", offset: 2 }, dir))).toBe("b\nc");
   });
 
-  it("applies multiple edits sequentially", async () => {
-    const conn = mockClient({
-      "fs/read_text_file": mock().mockResolvedValue({ content: "a b c" }),
-      "fs/write_text_file": mock().mockResolvedValue({}),
-    });
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { fs: { readTextFile: true, writeTextFile: true } },
-      cwd,
-    });
-    const editTool = tools.find((t) => t.name === "edit")!;
-
-    await editTool.execute(
-      "tc-1",
-      {
-        path: "test.txt",
-        edits: [
-          { oldText: "a", newText: "1" },
-          { oldText: "b", newText: "2" },
-          { oldText: "c", newText: "3" },
-        ],
-      },
-      undefined,
-      undefined,
-      {} as any,
+  it("reads images from the disk, the client serving text only", async () => {
+    const dir = tempDir();
+    // A complete 1x1 PNG.
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+      "base64",
     );
+    writeFileSync(join(dir, "pixel.png"), png);
+    const conn = mockClient();
 
-    expect(conn.method("fs/write_text_file")).toHaveBeenCalledWith({
-      sessionId,
-      path: "/home/user/project/test.txt",
-      content: "1 2 3",
-    });
+    const result = await run(conn, "read", { path: "pixel.png" }, dir);
+
+    expect(conn.method("fs/read_text_file")).not.toHaveBeenCalled();
+    expect(result.content.some((block: any) => block.type === "image")).toBe(true);
+  });
+
+  it("reports a missing file with its path", async () => {
+    await expect(
+      run(mockClient(), "read", { path: "/nonexistent/azpi-missing.txt" }),
+    ).rejects.toThrow("/nonexistent/azpi-missing.txt");
   });
 });
 
-describe("bash proxy", () => {
-  const cwd = "/home/user/project";
-  const sessionId = "test-session-id";
+describe("write", () => {
+  it("writes through the client, so it can review the change", async () => {
+    const dir = tempDir();
+    const conn = mockClient();
 
-  it("creates a terminal, polls until exit, returns output", async () => {
-    const conn = mockTerminalClient(
-      mock()
-        .mockResolvedValueOnce({ output: "progress...", truncated: false, exitStatus: undefined })
-        .mockResolvedValueOnce({
-          output: "final output",
-          truncated: false,
-          exitStatus: { exitCode: 0, signal: null },
-        }),
+    await run(conn, "write", { path: "new.txt", content: "hello" }, dir);
+
+    expect(conn.method("fs/write_text_file")).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      path: join(dir, "new.txt"),
+      content: "hello",
+    });
+  });
+
+  it("falls back to the disk, creating missing directories", async () => {
+    const dir = tempDir();
+    const conn = mockClient({ "fs/write_text_file": refuse });
+
+    await run(conn, "write", { path: "nested/new.txt", content: "hello" }, dir);
+
+    expect(readFileSync(join(dir, "nested/new.txt"), "utf8")).toBe("hello");
+  });
+});
+
+describe("edit", () => {
+  it("edits the client's version of the file and writes it back through the client", async () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "a.txt"), "stale disk copy");
+    const conn = mockClient({ "fs/read_text_file": async () => ({ content: "hello world\n" }) });
+
+    const result = await run(
+      conn,
+      "edit",
+      { path: "a.txt", edits: [{ oldText: "world", newText: "zed" }] },
+      dir,
     );
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { terminal: true },
-      cwd,
-    });
-    const bashTool = tools.find((t) => t.name === "bash")!;
 
-    const result = await bashTool.execute(
-      "tc-1",
-      { command: "echo hello" },
-      undefined,
-      undefined,
-      {} as any,
+    expect(conn.method("fs/write_text_file")).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      path: join(dir, "a.txt"),
+      content: "hello zed\n",
+    });
+    // Pi's own edit details, which the event bridge uses to locate the change.
+    expect(result.details).toMatchObject({ firstChangedLine: 1 });
+  });
+
+  it("edits on disk when the client refuses the path", async () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "a.txt"), "hello world");
+    const conn = mockClient({ "fs/read_text_file": refuse, "fs/write_text_file": refuse });
+
+    await run(conn, "edit", { path: "a.txt", edits: [{ oldText: "world", newText: "zed" }] }, dir);
+
+    expect(readFileSync(join(dir, "a.txt"), "utf8")).toBe("hello zed");
+  });
+});
+
+/** terminal/output answers: an exited command, or one still running. */
+const exited = (output: string, exitCode: number) => ({
+  output,
+  truncated: false,
+  exitStatus: { exitCode, signal: null },
+});
+const running = (output: string) => ({ output, truncated: false });
+
+describe("bash", () => {
+  /** A client whose terminal/output answers come from `outputs`, the last one repeating. */
+  function terminalClient(...outputs: object[]) {
+    const output = mock(async () => (outputs.length > 1 ? outputs.shift() : outputs[0]));
+    return mockClient({
+      "terminal/create": async () => ({ terminalId: "term-1" }),
+      "terminal/output": output,
+    });
+  }
+
+  it("runs the command in a client terminal and returns its output", async () => {
+    const conn = terminalClient(running("hel"), exited("hello\n", 0));
+
+    const result = await run(conn, "bash", { command: "echo hello" });
+
+    expect(conn.method("terminal/create")).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: SESSION_ID, command: "echo hello", cwd: "/" }),
     );
-
-    expect(conn.method("terminal/create")).toHaveBeenCalledWith({
-      sessionId,
-      command: "echo hello",
-      cwd,
-    });
-    expect(conn.method("terminal/output")).toHaveBeenCalledWith({
-      sessionId,
-      terminalId: "term-1",
-    });
-
-    expect(result.content[0]).toMatchObject({ type: "text" });
-    expect((result.content[0] as any).text).toBe("final output");
+    expect(textOf(result)).toBe("hello\n");
+    expect(result.isError).toBeFalsy();
     expect(conn.method("terminal/release")).toHaveBeenCalledWith({
-      sessionId,
+      sessionId: SESSION_ID,
       terminalId: "term-1",
     });
-  });
-
-  it("streams partial output via onUpdate callback", async () => {
-    const onUpdate = mock();
-    const conn = mockTerminalClient(
-      mock()
-        .mockResolvedValueOnce({ output: "hello", truncated: false, exitStatus: undefined })
-        .mockResolvedValueOnce({ output: "hello world", truncated: false, exitStatus: undefined })
-        .mockResolvedValueOnce({
-          output: "hello world",
-          truncated: false,
-          exitStatus: { exitCode: 0, signal: null },
-        }),
-    );
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { terminal: true },
-      cwd,
-    });
-    const bashTool = tools.find((t) => t.name === "bash")!;
-
-    await bashTool.execute("tc-1", { command: "echo hello" }, undefined, onUpdate, {} as any);
-
-    expect(onUpdate).toHaveBeenCalled();
-    const firstCall = onUpdate.mock.calls[0]![0];
-    expect(firstCall.content[0].text).toBe("hello");
-  });
-
-  it("kills and releases terminal on cancellation", async () => {
-    const conn = mockTerminalClient(async () => ({
-      output: "partial",
-      truncated: false,
-      exitStatus: undefined,
-    }));
-
-    // Create an abort controller that fires
-    const controller = new AbortController();
-    const signal = controller.signal;
-
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { terminal: true },
-      cwd,
-    });
-    const bashTool = tools.find((t) => t.name === "bash")!;
-
-    const promise = bashTool.execute(
-      "tc-1",
-      { command: "sleep 100" },
-      signal,
-      undefined,
-      {} as any,
-    );
-    controller.abort();
-
-    const result = await promise;
-    expect(conn.method("terminal/kill")).toHaveBeenCalled();
-    expect(conn.method("terminal/release")).toHaveBeenCalled();
-    expect((result.content[0] as any).text).toContain("Command cancelled");
-  });
-
-  it("times out after specified duration", async () => {
-    const conn = mockTerminalClient(async () => ({
-      output: "running...",
-      truncated: false,
-      exitStatus: undefined,
-    }));
-
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { terminal: true },
-      cwd,
-    });
-    const bashTool = tools.find((t) => t.name === "bash")!;
-
-    // Pi's bash timeout is in seconds: this one fires after about a second.
-    const result = await bashTool.execute(
-      "tc-1",
-      { command: "sleep 100", timeout: 1 },
-      undefined,
-      undefined,
-      {} as any,
-    );
-
-    expect(conn.method("terminal/kill")).toHaveBeenCalled();
-    expect(conn.method("terminal/release")).toHaveBeenCalled();
-    expect((result.content[0] as any).text).toContain("timed out after 1 seconds");
-    expect(result.isError).toBe(true);
   });
 
   it("embeds the terminal in the tool call before releasing it", async () => {
-    const conn = mockTerminalClient(async () => ({
-      output: "ok",
-      truncated: false,
-      exitStatus: { exitCode: 0, signal: null },
-    }));
+    const conn = terminalClient(exited("ok", 0));
 
-    const result = await proxyTool(conn, "bash").execute(
-      "tc-1",
-      { command: "true" },
-      undefined,
-      undefined,
-      {} as any,
-    );
+    const result = await run(conn, "bash", { command: "true" });
 
     expect(conn.sessionUpdate).toHaveBeenCalledWith({
-      sessionId: "test-session-id",
+      sessionId: SESSION_ID,
       update: {
         sessionUpdate: "tool_call_update",
         toolCallId: "tc-1",
@@ -514,108 +233,114 @@ describe("bash proxy", () => {
     const embedOrder = conn.sessionUpdate.mock.invocationCallOrder[0]!;
     const releaseOrder = conn.method("terminal/release").mock.invocationCallOrder[0]!;
     expect(embedOrder).toBeLessThan(releaseOrder);
-    expect(result.details).toMatchObject({ terminalId: "term-1", exitCode: 0 });
+    expect(result.details).toMatchObject({ terminalId: "term-1" });
   });
 
-  it("reports a non-zero exit code as an error, like Pi's native bash", async () => {
-    const conn = mockTerminalClient(async () => ({
-      output: "boom",
-      truncated: false,
-      exitStatus: { exitCode: 2, signal: null },
-    }));
+  it("tags partial results with the terminal, so the card keeps showing it", async () => {
+    const conn = terminalClient(running("a"), exited("ab", 0));
+    const onUpdate = mock();
 
-    const result = await proxyTool(conn, "bash").execute(
-      "tc-1",
-      { command: "false" },
-      undefined,
-      undefined,
-      {} as any,
-    );
+    await tool(conn, "bash").execute("tc-1", { command: "x" }, undefined, onUpdate, toolContext);
+
+    const partials = onUpdate.mock.calls.map((call: any[]) => call[0]);
+    expect(partials.length).toBeGreaterThan(0);
+    expect(partials.at(-1).details).toMatchObject({ terminalId: "term-1" });
+  });
+
+  it("reports a non-zero exit code as an error, as Pi does", async () => {
+    const conn = terminalClient(exited("boom", 2));
+
+    const result = await run(conn, "bash", { command: "false" });
 
     expect(result.isError).toBe(true);
-    expect((result.content[0] as any).text).toBe("boom\n\nCommand exited with code 2");
+    expect(textOf(result)).toBe("boom\n\nCommand exited with code 2");
   });
 
-  it("releases terminal on error", async () => {
-    const conn = mockTerminalClient(async () => {
-      throw new Error("connection lost");
+  it("kills and releases the terminal when aborted", async () => {
+    const conn = terminalClient(running("partial"));
+    const controller = new AbortController();
+
+    const promise = tool(conn, "bash").execute(
+      "tc-1",
+      { command: "sleep 100" },
+      controller.signal,
+      undefined,
+      toolContext,
+    );
+    setTimeout(() => controller.abort(), 20);
+
+    await expect(promise).rejects.toThrow("Command aborted");
+    expect(conn.method("terminal/kill")).toHaveBeenCalled();
+    expect(conn.method("terminal/release")).toHaveBeenCalled();
+  });
+
+  it("kills the terminal once the timeout, in seconds, runs out", async () => {
+    const conn = terminalClient(running("still going"));
+
+    await expect(run(conn, "bash", { command: "sleep 100", timeout: 0.3 })).rejects.toThrow(
+      "Command timed out after 0.3 seconds",
+    );
+    expect(conn.method("terminal/kill")).toHaveBeenCalled();
+    expect(conn.method("terminal/release")).toHaveBeenCalled();
+  });
+
+  it("passes the session's PI_* variables to the command", async () => {
+    const conn = terminalClient(exited("", 0));
+
+    await run(conn, "bash", { command: "env" });
+
+    const env = (conn.method("terminal/create").mock.calls[0]![0] as any).env;
+    expect(env).toContainEqual({ name: "PI_SESSION_ID", value: "pi-session" });
+    expect(env.every((variable: any) => variable.name.startsWith("PI_"))).toBe(true);
+  });
+
+  it("releases the terminal when the client fails mid-command", async () => {
+    const conn = mockClient({
+      "terminal/create": async () => ({ terminalId: "term-1" }),
+      "terminal/output": async () => {
+        throw new Error("connection lost");
+      },
     });
 
-    const tools = createAcpProxyTools({
-      client: conn,
-      sessionId,
-      capabilities: { terminal: true },
-      cwd,
-    });
-    const bashTool = tools.find((t) => t.name === "bash")!;
-
-    await expect(
-      bashTool.execute("tc-1", { command: "echo hello" }, undefined, undefined, {} as any),
-    ).rejects.toThrow("connection lost");
-
+    await expect(run(conn, "bash", { command: "echo hello" })).rejects.toThrow("connection lost");
     expect(conn.method("terminal/release")).toHaveBeenCalled();
   });
 });
 
-describe("disk fallback when the client refuses a path", () => {
-  it("reads from disk", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "azpi-"));
-    writeFileSync(join(dir, "outside.txt"), "a\nb\nc");
-    const conn = mockClient({ "fs/read_text_file": refuse });
-
-    const result = await proxyTool(conn, "read", dir).execute(
-      "tc-1",
-      { path: "outside.txt", offset: 2 },
-      undefined,
-      undefined,
-      {} as any,
-    );
-
-    expect((result.content[0] as any).text).toBe("b\nc");
+describe("outputForwarder", () => {
+  it("forwards only what each snapshot adds", () => {
+    const chunks: string[] = [];
+    const forward = outputForwarder((data) => chunks.push(data.toString()));
+    forward("a");
+    forward("ab");
+    forward("ab");
+    forward("abc");
+    expect(chunks).toEqual(["a", "b", "c"]);
   });
 
-  it("reports the disk error, which names the path, when the file is missing", async () => {
-    const conn = mockClient({ "fs/read_text_file": refuse });
-
-    await expect(
-      proxyTool(conn, "read").execute(
-        "tc-1",
-        { path: "/nonexistent/azpi-missing.txt" },
-        undefined,
-        undefined,
-        {} as any,
-      ),
-    ).rejects.toThrow("/nonexistent/azpi-missing.txt");
+  it("skips a snapshot whose start the client truncated, then resumes", () => {
+    const chunks: string[] = [];
+    const forward = outputForwarder((data) => chunks.push(data.toString()));
+    forward("abc");
+    forward("cde");
+    forward("cdef");
+    expect(chunks).toEqual(["abc", "f"]);
   });
+});
 
-  it("writes to disk, creating missing directories", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "azpi-"));
-    const conn = mockClient({ "fs/write_text_file": refuse });
-
-    await proxyTool(conn, "write", dir).execute(
-      "tc-1",
-      { path: "nested/new.txt", content: "hello" },
-      undefined,
-      undefined,
-      {} as any,
-    );
-
-    expect(readFileSync(join(dir, "nested/new.txt"), "utf8")).toBe("hello");
+describe("exitCodeOf", () => {
+  it("keeps a real exit code and maps a signal the way shells do", () => {
+    expect(exitCodeOf({ exitCode: 3 })).toBe(3);
+    expect(exitCodeOf({ exitCode: null, signal: "SIGKILL" })).toBe(137);
+    expect(exitCodeOf({ exitCode: null, signal: null })).toBeNull();
   });
+});
 
-  it("edits on disk", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "azpi-"));
-    writeFileSync(join(dir, "a.txt"), "hello world");
-    const conn = mockClient({ "fs/read_text_file": refuse, "fs/write_text_file": refuse });
-
-    await proxyTool(conn, "edit", dir).execute(
-      "tc-1",
-      { path: "a.txt", edits: [{ oldText: "world", newText: "zed" }] },
-      undefined,
-      undefined,
-      {} as any,
-    );
-
-    expect(readFileSync(join(dir, "a.txt"), "utf8")).toBe("hello zed");
+describe("piVariables", () => {
+  it("keeps only the PI_* variables", () => {
+    expect(piVariables({ PATH: "/bin", PI_MODEL: "claude", HOME: "/root" })).toEqual([
+      { name: "PI_MODEL", value: "claude" },
+    ]);
+    expect(piVariables(undefined)).toEqual([]);
   });
 });

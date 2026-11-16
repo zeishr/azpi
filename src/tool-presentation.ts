@@ -35,7 +35,8 @@ type Args = Record<string, unknown>;
 
 /**
  * How one tool is shown. Content hooks return undefined to leave the card's
- * current content untouched: ACP replaces the whole content list on update.
+ * current content untouched (ACP replaces the whole content list on update),
+ * so a result hook that does so on failure must have shown the failure itself.
  */
 interface ToolPresenter {
   kind: ToolKind;
@@ -66,7 +67,7 @@ const PRESENTERS: Record<string, ToolPresenter> = {
     title: (args, ctx) => `Read ${displayPath(args.path, ctx)}${lineRange(args)}`,
     locations: (args, ctx) => fileLocation(args.path, ctx, numberArg(args.offset)),
     result: (args, outcome) =>
-      outcome.isError ? undefined : codeContent(outcome, languageOf(args.path)),
+      outcome.isError ? textContent(outcome) : codeContent(outcome, languageOf(args.path)),
   },
   write: {
     kind: "edit",
@@ -94,18 +95,18 @@ const PRESENTERS: Record<string, ToolPresenter> = {
     title: (args, ctx) =>
       `Grep ${inlineCode(stringArg(args.pattern) ?? "")} in ${displayPath(args.path ?? ".", ctx)}` +
       (stringArg(args.glob) ? ` (${args.glob})` : ""),
-    result: (_args, outcome) => (outcome.isError ? undefined : codeContent(outcome, "")),
+    result: (_args, outcome) => (outcome.isError ? textContent(outcome) : codeContent(outcome, "")),
   },
   find: {
     kind: "search",
     title: (args, ctx) =>
       `Find ${inlineCode(stringArg(args.pattern) ?? "")} in ${displayPath(args.path ?? ".", ctx)}`,
-    result: (_args, outcome) => (outcome.isError ? undefined : codeContent(outcome, "")),
+    result: (_args, outcome) => (outcome.isError ? textContent(outcome) : codeContent(outcome, "")),
   },
   ls: {
     kind: "search",
     title: (args, ctx) => `List ${displayPath(args.path ?? ".", ctx)}`,
-    result: (_args, outcome) => (outcome.isError ? undefined : codeContent(outcome, "")),
+    result: (_args, outcome) => (outcome.isError ? textContent(outcome) : codeContent(outcome, "")),
   },
   web_search: {
     kind: "search",
@@ -180,11 +181,7 @@ export function presentToolResult(
   ctx: PresentationContext,
 ): ToolCallContent[] | undefined {
   const presenter = presenterFor(name);
-  if (presenter.result) {
-    const content = presenter.result(asArgs(rawArgs), outcome, ctx);
-    // A presenter that declines an error still has to surface the message.
-    return content ?? (outcome.isError ? textContent(outcome) : undefined);
-  }
+  if (presenter.result) return presenter.result(asArgs(rawArgs), outcome, ctx);
   return resultBlocks(outcome);
 }
 
@@ -218,9 +215,10 @@ function shellOutput(
   outcome: ToolOutcome,
   ctx: PresentationContext,
 ): ToolCallContent[] | undefined {
-  if (terminalIdOf(outcome.details)) {
-    return ctx.live ? undefined : codeContent(outcome, "console");
-  }
+  // Kept on failure too: the client ran the command and shows its exit status.
+  if (terminalIdOf(outcome.details) && ctx.live) return undefined;
+  // Pi opens a bash call with an empty update, before any output exists.
+  if (!textOf(outcome.content)) return undefined;
   return codeContent(outcome, "console");
 }
 
