@@ -9,6 +9,9 @@
 
 A seamless ACP client built on top of the Pi coding agent.
 
+> This is a maintained fork of [Th1nkK1D/azpi](https://github.com/Th1nkK1D/azpi). It tracks the
+> latest Pi release and adds detailed tool call cards and subagent cards (see Features).
+
 ## Why?
 
 The [Agent Client Protocol (ACP)](https://agentclientprotocol.com) standardizes communication between code editors/IDEs and coding agents. It breaks vendor lock-in, allowing both sides to innovate independently while giving developers the freedom to choose the best tools for their workflow—like me, as a fan of [Zed](https://zed.dev) and [Pi](https://pi.dev).
@@ -24,8 +27,11 @@ Pi does not support ACP out of the box. While there are a few ACP adapters that 
 - **Startup message** — Displays Pi version, loaded contexts, extensions, and skills upon launch.
 - **Rich content** — Handles `text`, `image`, `resource`, and `resource_link` content blocks.
 - **Real-time event streaming** — Bridges text, thinking, tool execution, and session info changes directly to ACP.
+- **Detailed tool calls** — Each call gets a readable title, an ACP kind (icon), the files it touches for follow-along, and content suited to the tool: a diff per edit, highlighted code for reads, console output for bash. Reopened sessions look the same as live ones.
+- **Subagent cards** — [pi-subagents](https://github.com/nicobailon/pi-subagents) runs show their children live: one card per workflow child, or the single child in the call's own card, with model, counters, current and recent tools, then the output.
+- **Context, compaction and retries** — Reports context fill and cost after each turn (`usage_update`), and compactions and auto-retries to clients that support them.
 - **Auto session naming** — Automatically derives session names from the initial prompt. Set `AZPI_SESSION_NAMING_MODEL` to a `provider/modelId` to generate names via LLM. Falls back to the heuristic trimming method.
-- **Client tool proxy** — Delegates `read`, `write`, `edit`, and `bash` to the ACP client when available, enabling editors like Zed to display agent change diffs.
+- **Client tool proxy** — Delegates `read`, `write`, `edit`, and `bash` to the ACP client when available, enabling editors like Zed to display agent change diffs and live terminals. Paths the client refuses (outside its project) fall back to the disk.
 - **Slash commands** — Supports Pi's built-in commands (`/name`, `/session`, `/compact`, `/export`, and `/reload`), skills, prompt templates, and extension commands (opt-in via `AZPI_ALLOW_EXTENSION_COMMANDS`, disabled by default).
 
 ## Usage
@@ -33,10 +39,14 @@ Pi does not support ACP out of the box. While there are a few ACP adapters that 
 The package is not yet pre-built or published. You can clone the repository, install dependencies and run AZPi using [Bun](https://bun.com/):
 
 ```bash
-git clone https://github.com/Th1nkK1D/azpi.git
+git clone https://github.com/zeishr/azpi.git
 cd azpi
 bun i
 ```
+
+AZPi bundles the Pi SDK, since the `pi` CLI ships as a compiled binary. Both share settings and
+sessions, so keep them on the same version: the startup message warns when they drift, and
+`bun run sync:pi` aligns the bundled SDK with `pi --version`.
 
 An example configuration for Zed:
 
