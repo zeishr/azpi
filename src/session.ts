@@ -130,10 +130,7 @@ function replayAssistantMessage(
     } else if (block.type === "toolCall") {
       if (typeof block.id === "string" && typeof block.name === "string") {
         // Pending until its result entry, so a call that never got one does not look finished.
-        send({
-          sessionUpdate: SessionUpdateType.ToolCall,
-          ...tools.start(block.id, block.name, block.arguments, "pending"),
-        });
+        tools.start(block.id, block.name, block.arguments, "pending").forEach(send);
       }
     } else if (block.type === "text") {
       const text = block.text;
@@ -147,20 +144,13 @@ function replayAssistantMessage(
   }
 }
 
-/** Emit a tool_call_update for a completed tool result. */
+/** Emit the tool_call_update of a tool result, plus the cards of any subagent children. */
 function replayToolResult(
   message: any,
   tools: ToolCallMapper,
   send: (update: SessionUpdate) => void,
 ): void {
   if (typeof message.toolCallId !== "string") return;
-  send({
-    sessionUpdate: SessionUpdateType.ToolCallUpdate,
-    ...tools.end(
-      message.toolCallId,
-      String(message.toolName ?? ""),
-      message,
-      Boolean(message.isError),
-    ),
-  });
+  const name = String(message.toolName ?? "");
+  tools.end(message.toolCallId, name, message, Boolean(message.isError)).forEach(send);
 }

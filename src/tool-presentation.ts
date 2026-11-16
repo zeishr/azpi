@@ -1,5 +1,6 @@
 import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
 import { extname, isAbsolute, relative, resolve } from "node:path";
+import { childCard, runsSeveralChildren, subagentChildren, subagentTitle } from "./subagent-cards";
 
 /**
  * Turns Pi tool calls into what an ACP client displays: a title, an icon
@@ -113,6 +114,27 @@ const PRESENTERS: Record<string, ToolPresenter> = {
   fetch_content: {
     kind: "fetch",
     title: (args) => `Fetch ${listArg(args.urls ?? args.url).join(", ")}`,
+  },
+  // A call running several children gets one card per child from the
+  // ToolCallMapper; this card then only carries the call's own result.
+  subagent: {
+    kind: "think",
+    title: (args) => subagentTitle(args),
+    progress: (args, partial) => {
+      const [child] = subagentChildren(partial.details);
+      if (runsSeveralChildren(args) || !child) return undefined;
+      return childCard(child, { includeOutput: false }).content;
+    },
+    result: (args, outcome) => {
+      const [child] = subagentChildren(outcome.details);
+      if (runsSeveralChildren(args) || !child) return resultBlocks(outcome);
+      const callStatus = outcome.isError ? "failed" : "completed";
+      // Stats and errors of the child, then the output the parent model received.
+      return [
+        ...childCard(child, { callStatus, includeOutput: false }).content,
+        ...resultBlocks(outcome),
+      ];
+    },
   },
 };
 

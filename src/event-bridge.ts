@@ -39,9 +39,36 @@ export class SessionEventBridge {
     this.sendsCompactions = Boolean(options.capabilities?.session?.compaction);
   }
 
-  map(event: AgentSessionEvent, configOptions?: SessionConfigOption[]): SessionNotification | null {
-    const update = this.mapUpdate(event, configOptions);
-    return update ? { sessionId: this.options.sessionId, update } : null;
+  /** Most events map to one notification or none; a subagent call may update several cards. */
+  map(event: AgentSessionEvent, configOptions?: SessionConfigOption[]): SessionNotification[] {
+    const { sessionId } = this.options;
+    return this.mapUpdates(event, configOptions).map((update) => ({ sessionId, update }));
+  }
+
+  private mapUpdates(
+    event: AgentSessionEvent,
+    configOptions?: SessionConfigOption[],
+  ): SessionUpdate[] {
+    switch (event.type) {
+      case "tool_execution_start":
+        return this.tools.start(event.toolCallId, event.toolName, event.args, "in_progress");
+
+      case "tool_execution_update":
+        return this.tools.progress(
+          event.toolCallId,
+          event.toolName,
+          event.args,
+          event.partialResult,
+        );
+
+      case "tool_execution_end":
+        return this.tools.end(event.toolCallId, event.toolName, event.result, event.isError);
+
+      default: {
+        const update = this.mapUpdate(event, configOptions);
+        return update ? [update] : [];
+      }
+    }
   }
 
   private mapUpdate(
@@ -51,28 +78,6 @@ export class SessionEventBridge {
     switch (event.type) {
       case "message_update":
         return mapAssistantDelta(event.assistantMessageEvent);
-
-      case "tool_execution_start":
-        return {
-          sessionUpdate: SessionUpdateType.ToolCall,
-          ...this.tools.start(event.toolCallId, event.toolName, event.args, "in_progress"),
-        };
-
-      case "tool_execution_update": {
-        const update = this.tools.progress(
-          event.toolCallId,
-          event.toolName,
-          event.args,
-          event.partialResult,
-        );
-        return update && { sessionUpdate: SessionUpdateType.ToolCallUpdate, ...update };
-      }
-
-      case "tool_execution_end":
-        return {
-          sessionUpdate: SessionUpdateType.ToolCallUpdate,
-          ...this.tools.end(event.toolCallId, event.toolName, event.result, event.isError),
-        };
 
       case "session_info_changed":
         return { sessionUpdate: SessionUpdateType.SessionInfoUpdate, title: event.name ?? null };

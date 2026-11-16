@@ -597,8 +597,7 @@ export class PiAcpAgent {
       session && event.type === "thinking_level_changed"
         ? this.buildConfigOptions(session)
         : undefined;
-    const notification = this.bridges.get(sessionId)?.map(event, configOptions);
-    if (notification) {
+    for (const notification of this.bridges.get(sessionId)?.map(event, configOptions) ?? []) {
       this.safeNotify(() => this.client.notify("session/update", notification));
     }
 

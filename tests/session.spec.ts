@@ -291,6 +291,51 @@ describe("replaySessionHistory", () => {
     expect(end.locations).toEqual([{ path: "/repo/src/a.ts", line: 4 }]);
   });
 
+  it("replays a subagent workflow with one card per child", async () => {
+    const conn = createMockConnection();
+    const args = { workflow: "parallel", args: { tasks: [{ agent: "a" }, { agent: "b" }] } };
+    const session = createMockSessionWithEntries([
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call_wf", name: "subagent", arguments: args }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "call_wf",
+          toolName: "subagent",
+          content: [{ type: "text", text: "Workflow completed." }],
+          details: {
+            workflowChildren: {
+              version: 1,
+              children: [
+                { childId: "task-1", state: "completed", agent: "a" },
+                { childId: "task-2", state: "failed", agent: "b" },
+              ],
+            },
+            results: [{ index: 0, workflowKey: "task-1", finalOutput: "done" }],
+          },
+          isError: false,
+        },
+      },
+    ]);
+
+    await replaySessionHistory(session, "test-session", conn);
+
+    const updates = (conn.sessionUpdate.mock.calls as any[]).map((call) => call[0].update);
+    expect(updates.map((u) => [u.sessionUpdate, u.toolCallId, u.status])).toEqual([
+      ["tool_call", "call_wf", "pending"],
+      ["tool_call", "call_wf/child-task-1", "completed"],
+      ["tool_call", "call_wf/child-task-2", "failed"],
+      ["tool_call_update", "call_wf", "completed"],
+    ]);
+    expect(updates[1].content[0].content.text).toBe("done");
+  });
+
   it("replays a terminal-backed bash call with its output, since the terminal is gone", async () => {
     const conn = createMockConnection();
     const session = createMockSessionWithEntries([
