@@ -66,6 +66,8 @@ function createMockSession(overrides?: Partial<AgentSession>): AgentSession {
     prompt: mock(async () => {}),
     abort: mock(async () => {}),
     dispose: mock(() => {}),
+    getContextUsage: () => ({ tokens: 1200, contextWindow: 200000, percent: 0.6 }),
+    getSessionStats: () => ({ cost: 0.01 }),
     resourceLoader: mockResourceLoader,
     sessionManager: mockSessionManager,
     agent: {
@@ -273,6 +275,32 @@ describe("PiAcpAgent", () => {
       expect(cmds.length).toBeGreaterThanOrEqual(5);
       expect(cmds.map((c: any) => c.name)).toContain("name");
       expect(cmds.map((c: any) => c.name)).toContain("reload");
+    });
+
+    it("reports the context fill as soon as a session opens, so Zed shows its ring", async () => {
+      const models = [createMockModel()];
+      const mockSession = createMockSession({ model: models[0] });
+      const conn = createMockConnection();
+      const agent = new PiAcpAgent(conn, {
+        modelRuntime: createMockModelRuntime(),
+        modelRegistry: createMockRegistry(models) as any,
+        sessionFactory: async () => ({ session: mockSession }),
+      });
+
+      await agent.newSession(newSessionReq());
+      await new Promise((r) => setImmediate(r));
+
+      const usage = (conn.sessionUpdate.mock.calls as any[])
+        .map((call) => call[0].update)
+        .filter((update) => update.sessionUpdate === "usage_update");
+      expect(usage).toEqual([
+        {
+          sessionUpdate: "usage_update",
+          used: 1200,
+          size: 200000,
+          cost: { amount: 0.01, currency: "USD" },
+        },
+      ]);
     });
 
     it("falls back to first available model when session has no model", async () => {
@@ -506,6 +534,8 @@ describe("PiAcpAgent", () => {
       });
 
       const newSessionResult = await agent.newSession(newSessionReq());
+      await new Promise((r) => setImmediate(r));
+      conn.sessionUpdate.mockClear?.();
       const result = await agent.setSessionConfigOption({
         sessionId: newSessionResult.sessionId,
         configId: "model",
@@ -513,6 +543,9 @@ describe("PiAcpAgent", () => {
       });
 
       expect(mockSession.setModel).toHaveBeenCalled();
+      // The new model comes with its own context window.
+      const updates = (conn.sessionUpdate.mock.calls as any[]).map((call) => call[0].update);
+      expect(updates.some((update) => update.sessionUpdate === "usage_update")).toBe(true);
       expect(result.configOptions).toHaveLength(2);
       expect(result.configOptions[0]!.id).toBe("model");
       expect(result.configOptions[0]!.currentValue).toBe("anthropic/claude-3");

@@ -167,6 +167,7 @@ export class PiAcpAgent {
     setImmediate(() => {
       this.safeNotify(() => this.discoverAndEmitCommands(sessionId));
       this.sendStartupMessage(sessionId, session);
+      this.sendUsageUpdate(sessionId, session);
     });
 
     return {
@@ -187,6 +188,7 @@ export class PiAcpAgent {
     if (sessionPath) {
       await replaySessionHistory(session, sessionId, this.client);
     }
+    this.sendUsageUpdate(sessionId, session);
 
     this.startupMessageSent.add(sessionId);
     this.safeNotify(() => this.discoverAndEmitCommands(sessionId));
@@ -208,6 +210,7 @@ export class PiAcpAgent {
     if (sessionPath) {
       await replaySessionHistory(session, sessionId, this.client);
     }
+    this.sendUsageUpdate(sessionId, session);
 
     return {};
   }
@@ -240,6 +243,7 @@ export class PiAcpAgent {
     try {
       await session.setModel(model);
       await this.sendConfigOptionsUpdate(sessionId);
+      this.sendUsageUpdate(sessionId, session);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       this.notifyError(sessionId, message);
@@ -260,6 +264,8 @@ export class PiAcpAgent {
       if (configId === "model") {
         const model = resolveModelById(this.modelRegistry, value as string);
         await session.setModel(model);
+        // The context window comes with the model.
+        this.sendUsageUpdate(sessionId, session);
       } else if (configId === "thinking-level") {
         session.setThinkingLevel(value as AgentSession["thinkingLevel"]);
       } else {
@@ -618,6 +624,11 @@ export class PiAcpAgent {
     }
   }
 
+  /**
+   * Zed draws its context ring from these updates and shows none until the
+   * first one arrives, so they go out when a session opens, after each turn,
+   * and when the model, and with it the context window, changes.
+   */
   private sendUsageUpdate(sessionId: string, session: AgentSession): void {
     const update = buildUsageUpdate(session.getContextUsage(), session.getSessionStats().cost);
     if (update) {
