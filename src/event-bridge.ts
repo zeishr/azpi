@@ -33,7 +33,11 @@ export class SessionEventBridge {
   private currentCompactionId: string | undefined;
 
   constructor(private readonly options: SessionEventBridgeOptions) {
-    this.tools = new ToolCallMapper({ cwd: options.cwd, live: true });
+    this.tools = new ToolCallMapper({
+      cwd: options.cwd,
+      live: true,
+      terminalDisplay: advertisesDisplayTerminals(options.capabilities),
+    });
     // Both updates are opt-in: ACP forbids sending them to a client that did not ask.
     this.sendsNotices = Boolean(options.capabilities?.session?.notices);
     this.sendsCompactions = Boolean(options.capabilities?.session?.compaction);
@@ -164,6 +168,14 @@ export class SessionEventBridge {
       ...(description ? { description } : {}),
     };
   }
+}
+
+/**
+ * Zed's convention for terminals the agent feeds: a client that can show them
+ * says so in the metadata of its capabilities, outside the ACP schema.
+ */
+function advertisesDisplayTerminals(capabilities: ClientCapabilities | undefined): boolean {
+  return capabilities?._meta?.terminal_output === true;
 }
 
 function mapAssistantDelta(

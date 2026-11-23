@@ -56,15 +56,8 @@ describe("ToolCallMapper", () => {
     });
 
     it("sends nothing when the presenter keeps the current content", () => {
-      const update = live().progress(
-        "tc-1",
-        "bash",
-        { command: "make" },
-        {
-          content: [{ type: "text", text: "..." }],
-          details: { terminalId: "t1" },
-        },
-      );
+      // Pi opens every bash call with an empty update.
+      const update = live().progress("tc-1", "bash", { command: "make" }, { content: [] });
       expect(update).toEqual([]);
     });
   });

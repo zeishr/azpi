@@ -14,6 +14,10 @@ import {
   presentToolResult,
 } from "./tool-presentation";
 import type { PresentationContext, ToolOutcome } from "./tool-presentation";
+import { TerminalMirror, exitStatusOf } from "./terminal-mirror";
+
+/** The tool whose output a client may show in a display terminal. */
+const SHELL_TOOL = "bash";
 
 /**
  * Builds the ACP tool call notifications of one session.
@@ -24,6 +28,11 @@ import type { PresentationContext, ToolOutcome } from "./tool-presentation";
  *
  * A `subagent` call that runs several children also gets one card per child,
  * created as each child shows up and updated only when its card changes.
+ *
+ * A bash call, for a client that displays terminals the agent feeds, shows a
+ * terminal fed with its output instead of text. Its content is then never
+ * resent: ACP replaces the whole content list on update, which would drop
+ * the terminal.
  */
 export class ToolCallMapper {
   private readonly calls = new Map<string, { name: string; args: unknown }>();
@@ -32,6 +41,8 @@ export class ToolCallMapper {
    * than what a card shows changes (a subagent's every event, for instance).
    */
   private readonly lastProgress = new Map<string, string>();
+  /** Display terminals of the bash calls still running, by tool call id. */
+  private readonly terminals = new Map<string, TerminalMirror>();
   /** Last card sent for each child, by parent tool call id then child key. */
   private readonly childCards = new Map<
     string,
@@ -44,16 +55,25 @@ export class ToolCallMapper {
     this.calls.set(toolCallId, { name, args });
     if (HIDDEN_NESTED_TOOLS.has(name)) return [];
     const view = presentToolCall(name, args, this.context);
+    const call = {
+      sessionUpdate: SessionUpdateType.ToolCall,
+      toolCallId,
+      title: view.title,
+      kind: view.kind,
+      status,
+      locations: view.locations,
+      content: view.content,
+      rawInput: args,
+    } as const;
+    if (!this.showsTerminal(name)) return [call];
+
+    // The call id doubles as the terminal id: unique per session and stable to its end.
+    this.terminals.set(toolCallId, new TerminalMirror(toolCallId));
     return [
       {
-        sessionUpdate: SessionUpdateType.ToolCall,
-        toolCallId,
-        title: view.title,
-        kind: view.kind,
-        status,
-        locations: view.locations,
-        content: view.content,
-        rawInput: args,
+        ...call,
+        content: [{ type: "terminal", terminalId: toolCallId }],
+        _meta: { terminal_info: { terminal_id: toolCallId, cwd: this.context.cwd } },
       },
     ];
   }
@@ -66,6 +86,9 @@ export class ToolCallMapper {
   ): SessionUpdate[] {
     if (HIDDEN_NESTED_TOOLS.has(name)) return [];
     const partial = toOutcome(partialResult, false);
+    const terminal = this.terminals.get(toolCallId);
+    if (terminal) return terminalOutput(toolCallId, terminal.progress(partial));
+
     const updates = this.childCardUpdates(toolCallId, name, args, partial.details);
     const content = presentToolProgress(name, args, partial, this.context);
     const serialized = JSON.stringify(content);
@@ -102,6 +125,22 @@ export class ToolCallMapper {
     this.childCards.delete(toolCallId);
     this.lastProgress.delete(toolCallId);
 
+    const terminal = this.terminals.get(toolCallId);
+    if (terminal) {
+      this.terminals.delete(toolCallId);
+      const output = terminal.finish(outcome);
+      updates.push({
+        sessionUpdate: SessionUpdateType.ToolCallUpdate,
+        toolCallId,
+        status,
+        _meta: {
+          ...(output ? { terminal_output: { terminal_id: toolCallId, data: output } } : {}),
+          terminal_exit: { terminal_id: toolCallId, ...exitStatusOf(outcome) },
+        },
+      });
+      return updates;
+    }
+
     const content = presentToolResult(call.name, call.args, outcome, this.context);
     const locations = presentResultLocations(call.name, call.args, outcome, this.context);
     updates.push({
@@ -112,6 +151,10 @@ export class ToolCallMapper {
       ...(locations === undefined ? {} : { locations }),
     });
     return updates;
+  }
+
+  private showsTerminal(name: string): boolean {
+    return name === SHELL_TOOL && this.context.live && this.context.terminalDisplay === true;
   }
 
   private childCardUpdates(
@@ -153,14 +196,30 @@ export class ToolCallMapper {
   }
 }
 
+/** Appends output to a call's display terminal, when there is any. */
+function terminalOutput(toolCallId: string, data: string | undefined): SessionUpdate[] {
+  if (!data) return [];
+  return [
+    {
+      sessionUpdate: SessionUpdateType.ToolCallUpdate,
+      toolCallId,
+      _meta: { terminal_output: { terminal_id: toolCallId, data } },
+    },
+  ];
+}
+
 /**
  * Normalizes what Pi hands over as a result: an AgentToolResult or a stored
  * ToolResultMessage (both `{ content, details }`), or a bare value.
  */
 function toOutcome(result: unknown, isError: boolean): ToolOutcome {
   if (result && typeof result === "object" && ("content" in result || "details" in result)) {
-    const { content, details } = result as { content: unknown; details?: unknown };
-    return { content, details, isError };
+    const { content, details, structuredContent } = result as {
+      content: unknown;
+      details?: unknown;
+      structuredContent?: unknown;
+    };
+    return { content, details, structuredContent, isError };
   }
   return { content: result, isError };
 }

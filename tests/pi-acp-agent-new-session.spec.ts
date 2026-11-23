@@ -1,5 +1,8 @@
 import { describe, expect, it, mock } from "bun:test";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { mockClient } from "./mock-client";
 
 let capturedCreateAgentSessionOptions: any;
@@ -44,6 +47,8 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
         prompt: mock(async () => {}),
         abort: mock(async () => {}),
         dispose: mock(() => {}),
+        getContextUsage: () => undefined,
+        getSessionStats: () => ({ cost: 0 }),
         bindExtensions: mock(async () => {}),
         resourceLoader: {
           getAgentsFiles: () => ({ agentsFiles: [] }),
@@ -67,12 +72,7 @@ const { PiAcpAgent } = await import("../src/pi-acp-agent");
 describe("PiAcpAgent newSession without sessionFactory", () => {
   it("creates proxy tools with the real sessionId", async () => {
     const conn = mockClient({
-      "terminal/create": async () => ({ terminalId: "term-1" }),
-      "terminal/output": async () => ({
-        output: "",
-        exitStatus: { exitCode: 0 },
-        truncated: false,
-      }),
+      "fs/read_text_file": async () => ({ content: "from the editor" }),
     });
     const agent = new PiAcpAgent(conn, {
       modelRuntime: {} as any,
@@ -98,22 +98,19 @@ describe("PiAcpAgent newSession without sessionFactory", () => {
     expect(capturedCreateAgentSessionOptions.customTools).toBeDefined();
     expect(capturedCreateAgentSessionOptions.customTools.length).toBeGreaterThan(0);
 
-    const bashTool = capturedCreateAgentSessionOptions.customTools.find(
-      (t: any) => t.name === "bash",
+    const readTool = capturedCreateAgentSessionOptions.customTools.find(
+      (t: any) => t.name === "read",
     );
-    expect(bashTool).toBeDefined();
+    expect(readTool).toBeDefined();
 
-    const toolContext = {
-      cwd: "/test",
-      sessionManager: { getSessionId: () => "real-session-id", getSessionFile: () => undefined },
-    };
-    await bashTool.execute("tc-1", { command: "echo hello" }, undefined, undefined, toolContext);
+    // Pi checks the file on disk before reading it through the client.
+    const file = join(mkdtempSync(join(tmpdir(), "azpi-")), "a.txt");
+    writeFileSync(file, "on disk");
+    await readTool.execute("tc-1", { path: file }, undefined, undefined, { cwd: "/test" });
 
-    expect(conn.method("terminal/create")).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionId: "real-session-id",
-        command: "echo hello",
-      }),
-    );
+    expect(conn.method("fs/read_text_file")).toHaveBeenCalledWith({
+      sessionId: "real-session-id",
+      path: file,
+    });
   });
 });

@@ -125,9 +125,8 @@ describe("presentToolProgress", () => {
     ]);
   });
 
-  it("leaves a terminal-backed bash card to its terminal", () => {
-    const partial = { ...text("..."), details: { terminalId: "t1" } };
-    expect(presentToolProgress("bash", {}, partial, ctx)).toBeUndefined();
+  it("skips the empty update Pi opens a bash call with", () => {
+    expect(presentToolProgress("bash", {}, { content: [], isError: false }, ctx)).toBeUndefined();
   });
 });
 
@@ -163,13 +162,11 @@ describe("presentToolResult", () => {
     expect(presentToolResult("edit", {}, outcome, ctx)).toEqual([textBlock("oldText not found")]);
   });
 
-  it("keeps a terminal-backed bash card on failure: the client shows the exit status", () => {
-    const outcome = {
-      ...text("boom\n\nCommand exited with code 3"),
-      details: { terminalId: "t1" },
-      isError: true,
-    };
-    expect(presentToolResult("bash", {}, outcome, ctx)).toBeUndefined();
+  it("shows a failed bash call's output and status as console text", () => {
+    const outcome = { ...text("boom\n\nCommand exited with code 3"), isError: true };
+    expect(presentToolResult("bash", {}, outcome, ctx)).toEqual([
+      textBlock("```console\nboom\n\nCommand exited with code 3\n```"),
+    ]);
   });
 
   it("shows the error of a failed read, grep, find or ls", () => {
@@ -188,9 +185,9 @@ describe("presentToolResult", () => {
     ]);
   });
 
-  it("shows a terminal-backed bash result as text on replay, its terminal being gone", () => {
+  it("shows a bash result that once ran in a client terminal as text on replay", () => {
+    // Sessions from AZPi versions that ran bash in Zed terminals tag details this way.
     const outcome = { ...text("ok"), details: { terminalId: "t1" } };
-    expect(presentToolResult("bash", {}, outcome, ctx)).toBeUndefined();
     expect(presentToolResult("bash", {}, outcome, replay)).toEqual([
       textBlock("```console\nok\n```"),
     ]);

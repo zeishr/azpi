@@ -13,14 +13,21 @@ import { childCard, runsSeveralChildren, subagentChildren, subagentTitle } from 
 export interface PresentationContext {
   /** Session working directory, used to resolve relative paths and shorten titles. */
   cwd: string;
-  /** False when rebuilding a stored session: the terminals it used are gone. */
+  /** False when rebuilding a stored session, whose output is only text by then. */
   live: boolean;
+  /**
+   * Whether the client shows bash output in a terminal the agent feeds, by
+   * Zed's `_meta.terminal_*` convention. Only meaningful while live.
+   */
+  terminalDisplay?: boolean;
 }
 
 /** A tool result as Pi produces it, live (AgentToolResult) or stored (ToolResultMessage). */
 export interface ToolOutcome {
   content?: unknown;
   details?: unknown;
+  /** Machine-readable result, such as bash's full output and exit code. */
+  structuredContent?: unknown;
   isError: boolean;
 }
 
@@ -87,8 +94,8 @@ const PRESENTERS: Record<string, ToolPresenter> = {
   bash: {
     kind: "execute",
     title: (args) => inlineCode(firstLine(stringArg(args.command) ?? "")),
-    progress: (_args, partial, ctx) => shellOutput(partial, ctx),
-    result: (_args, outcome, ctx) => shellOutput(outcome, ctx),
+    progress: (_args, partial) => shellOutput(partial),
+    result: (_args, outcome) => shellOutput(outcome),
   },
   grep: {
     kind: "search",
@@ -207,25 +214,13 @@ function genericTitle(name: string, args: Args): string {
 }
 
 /**
- * A bash card backed by an ACP terminal shows that terminal, which the client
- * streams on its own. Its content must not be resent: once released, the
- * terminal id is unknown to the client, which then rejects the whole update.
+ * Bash output as console text, for clients without a display terminal and for
+ * replayed sessions. A live display terminal is fed by the ToolCallMapper.
  */
-function shellOutput(
-  outcome: ToolOutcome,
-  ctx: PresentationContext,
-): ToolCallContent[] | undefined {
-  // Kept on failure too: the client ran the command and shows its exit status.
-  if (terminalIdOf(outcome.details) && ctx.live) return undefined;
+function shellOutput(outcome: ToolOutcome): ToolCallContent[] | undefined {
   // Pi opens a bash call with an empty update, before any output exists.
   if (!textOf(outcome.content)) return undefined;
   return codeContent(outcome, "console");
-}
-
-export function terminalIdOf(details: unknown): string | undefined {
-  if (!details || typeof details !== "object") return undefined;
-  const id = (details as Record<string, unknown>).terminalId;
-  return typeof id === "string" ? id : undefined;
 }
 
 function editDiffs(args: Args, ctx: PresentationContext): ToolCallContent[] {

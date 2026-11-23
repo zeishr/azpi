@@ -108,36 +108,69 @@ describe("event-bridge", () => {
       expect((end!.update as any).content[0].content.text).toBe("```rs\nfn main() {}\n```");
     });
 
-    it("leaves a terminal-backed bash card alone while it streams", () => {
-      const update = mapOne(
-        bridge(),
+    describe("bash output", () => {
+      const displayClient = { _meta: { terminal_output: true } } as ClientCapabilities;
+      const start = asEvent({
+        type: "tool_execution_start",
+        toolCallId: "tc-sh",
+        toolName: "bash",
+        args: { command: "make" },
+      });
+      const partial = (text: string) =>
         asEvent({
           type: "tool_execution_update",
           toolCallId: "tc-sh",
           toolName: "bash",
-          args: { command: "sleep 1" },
-          partialResult: {
-            content: [{ type: "text", text: "..." }],
-            details: { terminalId: "t1" },
-          },
-        }),
-      );
-      expect(update).toBeNull();
-    });
+          args: { command: "make" },
+          partialResult: { content: [{ type: "text", text }] },
+        });
+      const end = asEvent({
+        type: "tool_execution_end",
+        toolCallId: "tc-sh",
+        toolName: "bash",
+        result: {
+          content: [{ type: "text", text: "build\nok\n" }],
+          structuredContent: { output: "build\nok\n", exit_code: 0 },
+        },
+        isError: false,
+      });
 
-    it("ends a terminal-backed bash call without resending the released terminal", () => {
-      const end = mapOne(
-        bridge(),
-        asEvent({
-          type: "tool_execution_end",
-          toolCallId: "tc-sh",
-          toolName: "bash",
-          result: { content: [{ type: "text", text: "done" }], details: { terminalId: "t1" } },
-          isError: false,
-        }),
-      );
-      expect((end!.update as any).status).toBe("completed");
-      expect("content" in end!.update).toBe(false);
+      it("feeds a display terminal for a client that shows them", () => {
+        const b = bridge(displayClient);
+
+        const call = mapOne(b, start)!.update as any;
+        expect(call.content).toEqual([{ type: "terminal", terminalId: "tc-sh" }]);
+        expect(call._meta).toEqual({ terminal_info: { terminal_id: "tc-sh", cwd: "/repo" } });
+
+        expect((mapOne(b, partial("build\n"))!.update as any)._meta).toEqual({
+          terminal_output: { terminal_id: "tc-sh", data: "build\n" },
+        });
+        // Pi resends the same snapshot until new output arrives.
+        expect(mapOne(b, partial("build\n"))).toBeNull();
+
+        const ended = mapOne(b, end)!.update as any;
+        expect(ended._meta).toEqual({
+          terminal_output: { terminal_id: "tc-sh", data: "ok\n" },
+          terminal_exit: { terminal_id: "tc-sh", exit_code: 0, signal: null },
+        });
+        expect(ended.status).toBe("completed");
+        // Resending content would replace the terminal in the card.
+        expect("content" in ended).toBe(false);
+      });
+
+      it("shows console text to a client without display terminals", () => {
+        const b = bridge();
+
+        const call = mapOne(b, start)!.update as any;
+        expect(call.content).toEqual([]);
+        expect(call._meta).toBeUndefined();
+        expect((mapOne(b, partial("build\n"))!.update as any).content[0].content.text).toBe(
+          "```console\nbuild\n```",
+        );
+        expect((mapOne(b, end)!.update as any).content[0].content.text).toBe(
+          "```console\nbuild\nok\n```",
+        );
+      });
     });
 
     it("maps tool_execution_update to tool_call_update", () => {
