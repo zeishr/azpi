@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SessionConfigOption, SessionNotification } from "@agentclientprotocol/sdk";
 import type { StopReason } from "@agentclientprotocol/sdk";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
@@ -30,7 +33,63 @@ function mapOne(
   return notifications[0] ?? null;
 }
 
+/** A child session file line: one read call. */
+const entry = (id: string) =>
+  `${JSON.stringify({
+    type: "message",
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id, name: "read", arguments: { path: `${id}.ts` } }],
+    },
+  })}\n`;
+
 describe("event-bridge", () => {
+  describe("subagent transcripts between events", () => {
+    const args = { workflow: "parallel", args: { tasks: [{ agent: "a" }] } };
+
+    it("re-reads them while the call runs, and stops once it ended", async () => {
+      const file = join(mkdtempSync(join(tmpdir(), "azpi-")), "session.jsonl");
+      writeFileSync(file, entry("first"));
+      const emitted: SessionNotification[] = [];
+      const b = new SessionEventBridge({
+        sessionId: SID,
+        cwd: "/repo",
+        emit: (notifications) => emitted.push(...notifications),
+        subagentPollMs: 5,
+      });
+      const call = { toolCallId: "tc-1", toolName: "subagent", args };
+
+      b.map(asEvent({ type: "tool_execution_start", ...call }));
+      b.map(
+        asEvent({
+          type: "tool_execution_update",
+          ...call,
+          partialResult: {
+            details: {
+              workflowChildren: {
+                version: 1,
+                children: [{ childId: "a", state: "running", agent: "a", sessionFile: file }],
+              },
+            },
+          },
+        }),
+      );
+      appendFileSync(file, entry("second"));
+      await Bun.sleep(40);
+
+      expect(emitted.map((n) => (n.update as any).toolCallId)).toEqual(["tc-1/child-a"]);
+      expect(JSON.stringify(emitted[0]!.update)).toContain("Read second.ts");
+
+      b.map(
+        asEvent({ type: "tool_execution_end", ...call, result: { content: [] }, isError: false }),
+      );
+      emitted.length = 0;
+      appendFileSync(file, entry("third"));
+      await Bun.sleep(40);
+      expect(emitted).toEqual([]);
+    });
+  });
+
   describe("SessionEventBridge", () => {
     it("maps message_update text_delta to agent_message_chunk", () => {
       const event = {
@@ -79,7 +138,7 @@ describe("event-bridge", () => {
       expect((result!.update as any).toolCallId).toBe("tc-1");
       // Pi emits tool_execution_start when the tool actually starts running.
       expect((result!.update as any).status).toBe("in_progress");
-      expect((result!.update as any).title).toBe("`ls`");
+      expect((result!.update as any).title).toBe("ls");
       expect((result!.update as any).kind).toBe("execute");
     });
 

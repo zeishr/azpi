@@ -16,7 +16,14 @@ export interface SessionEventBridgeOptions {
   /** Session working directory, used to resolve the paths tools receive. */
   cwd: string;
   capabilities?: ClientCapabilities;
+  /** Sends the notifications the bridge produces outside of any event. */
+  emit?: (notifications: SessionNotification[]) => void;
+  /** How often running subagents' transcripts are re-read; defaults to SUBAGENT_POLL_MS. */
+  subagentPollMs?: number;
 }
+
+/** How often the transcripts of running subagents are re-read between events. */
+const SUBAGENT_POLL_MS = 1000;
 
 /**
  * Maps the Pi events of one session to ACP session/update notifications.
@@ -31,6 +38,7 @@ export class SessionEventBridge {
   private readonly sendsCompactions: boolean;
   private compactionCount = 0;
   private currentCompactionId: string | undefined;
+  private subagentPoll: ReturnType<typeof setInterval> | undefined;
 
   constructor(private readonly options: SessionEventBridgeOptions) {
     this.tools = new ToolCallMapper({
@@ -45,8 +53,40 @@ export class SessionEventBridge {
 
   /** Most events map to one notification or none; a subagent call may update several cards. */
   map(event: AgentSessionEvent, configOptions?: SessionConfigOption[]): SessionNotification[] {
+    const notifications = this.notify(this.mapUpdates(event, configOptions));
+    this.syncSubagentPoll();
+    return notifications;
+  }
+
+  /** Stops the bridge's own work, when its session closes. */
+  dispose(): void {
+    clearInterval(this.subagentPoll);
+    this.subagentPoll = undefined;
+  }
+
+  private notify(updates: SessionUpdate[]): SessionNotification[] {
     const { sessionId } = this.options;
-    return this.mapUpdates(event, configOptions).map((update) => ({ sessionId, update }));
+    return updates.map((update) => ({ sessionId, update }));
+  }
+
+  /**
+   * Children of a workflow report little between their state changes, while
+   * their session files grow with every step: while a subagent call runs,
+   * those files are re-read on a timer.
+   */
+  private syncSubagentPoll(): void {
+    const { emit } = this.options;
+    if (!emit) return;
+    if (this.tools.subagentsRunning && !this.subagentPoll) {
+      this.subagentPoll = setInterval(() => {
+        const notifications = this.notify(this.tools.pollSubagents());
+        if (notifications.length > 0) emit(notifications);
+      }, this.options.subagentPollMs ?? SUBAGENT_POLL_MS);
+      // The timer must not keep the agent alive once its client is gone.
+      this.subagentPoll.unref?.();
+    } else if (!this.tools.subagentsRunning && this.subagentPoll) {
+      this.dispose();
+    }
   }
 
   private mapUpdates(

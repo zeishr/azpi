@@ -1,6 +1,6 @@
 import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
 import { extname, isAbsolute, relative, resolve } from "node:path";
-import { childCard, runsSeveralChildren, subagentChildren, subagentTitle } from "./subagent-cards";
+import { subagentTitle } from "./subagent-cards";
 
 /**
  * Turns Pi tool calls into what an ACP client displays: a title, an icon
@@ -93,7 +93,9 @@ const PRESENTERS: Record<string, ToolPresenter> = {
   },
   bash: {
     kind: "execute",
-    title: (args) => inlineCode(firstLine(stringArg(args.command) ?? "")),
+    // Zed shows a command title as plain text and as its terminal's label: no
+    // Markdown, and the whole command.
+    title: (args) => stringArg(args.command)?.trim() ?? "",
     progress: (_args, partial) => shellOutput(partial),
     result: (_args, outcome) => shellOutput(outcome),
   },
@@ -123,26 +125,11 @@ const PRESENTERS: Record<string, ToolPresenter> = {
     kind: "fetch",
     title: (args) => `Fetch ${listArg(args.urls ?? args.url).join(", ")}`,
   },
-  // A call running several children gets one card per child from the
-  // ToolCallMapper; this card then only carries the call's own result.
+  // The children's cards, and a single child's view in this card, follow
+  // their session files: the ToolCallMapper builds them with SubagentCalls.
   subagent: {
     kind: "think",
     title: (args) => subagentTitle(args),
-    progress: (args, partial) => {
-      const [child] = subagentChildren(partial.details);
-      if (runsSeveralChildren(args) || !child) return undefined;
-      return childCard(child, { includeOutput: false }).content;
-    },
-    result: (args, outcome) => {
-      const [child] = subagentChildren(outcome.details);
-      if (runsSeveralChildren(args) || !child) return resultBlocks(outcome);
-      const callStatus = outcome.isError ? "failed" : "completed";
-      // Stats and errors of the child, then the output the parent model received.
-      return [
-        ...childCard(child, { callStatus, includeOutput: false }).content,
-        ...resultBlocks(outcome),
-      ];
-    },
   },
 };
 
@@ -163,7 +150,8 @@ export function presentToolCall(
   const title =
     presenter === GENERIC_PRESENTER ? genericTitle(name, args) : presenter.title(args, ctx);
   return {
-    title: truncate(title || name),
+    // A command is shown whole: clients render it as plain text, without a header to fit.
+    title: presenter.kind === "execute" ? title || name : truncate(title || name),
     kind: presenter.kind,
     locations: presenter.locations?.(args, ctx) ?? [],
     content: presenter.preview?.(args, ctx) ?? [],
@@ -339,7 +327,7 @@ function describeRaw(value: unknown): string {
   return Array.isArray(value) && value.length === 0 ? "" : safeJson(value);
 }
 
-function inlineCode(text: string): string {
+export function inlineCode(text: string): string {
   const fence = "`".repeat(longestBacktickRun(text) + 1);
   // Markdown needs a space between the fence and content that touches a backtick.
   const pad = text.startsWith("`") || text.endsWith("`") ? " " : "";

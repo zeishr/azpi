@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+  inlineCode,
   presentResultLocations,
   presentToolCall,
   presentToolProgress,
@@ -70,18 +71,16 @@ describe("presentToolCall", () => {
     ]);
   });
 
-  it("titles a bash call with its first command line as code", () => {
-    const view = presentToolCall("bash", { command: "cd src\nmake test" }, ctx);
-    expect(view.title).toBe("`cd src …`");
+  it("titles a bash call with the whole command, as plain text", () => {
+    // Zed shows a command title as is, and as the label of its terminal.
+    const view = presentToolCall("bash", { command: "  cd src\nmake test " }, ctx);
+    expect(view.title).toBe("cd src\nmake test");
     expect(view.kind).toBe("execute");
   });
 
-  it("widens the code span of a command that contains backticks", () => {
-    // Markdown needs spaces inside the fence when the content ends with a backtick.
-    expect(presentToolCall("bash", { command: "echo `date`" }, ctx).title).toBe(
-      "`` echo `date` ``",
-    );
-    expect(presentToolCall("bash", { command: "a `b` c" }, ctx).title).toBe("``a `b` c``");
+  it("keeps a long command whole", () => {
+    const command = `echo ${"x".repeat(300)}`;
+    expect(presentToolCall("bash", { command }, ctx).title).toBe(command);
   });
 
   it("titles searches", () => {
@@ -112,9 +111,18 @@ describe("presentToolCall", () => {
   });
 
   it("truncates long titles", () => {
-    const title = presentToolCall("bash", { command: "x".repeat(300) }, ctx).title;
+    const title = presentToolCall("read", { path: `/${"x".repeat(300)}` }, ctx).title;
     expect(title.length).toBe(120);
     expect(title.endsWith("…")).toBe(true);
+  });
+});
+
+describe("inlineCode", () => {
+  it("widens the code span of text that contains backticks", () => {
+    // Markdown needs spaces inside the fence when the content touches a backtick.
+    expect(inlineCode("echo `date`")).toBe("`` echo `date` ``");
+    expect(inlineCode("a `b` c")).toBe("``a `b` c``");
+    expect(inlineCode("ls")).toBe("`ls`");
   });
 });
 

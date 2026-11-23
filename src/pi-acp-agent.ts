@@ -546,7 +546,16 @@ export class PiAcpAgent {
     this.sessions.set(sessionId, session);
     this.bridges.set(
       sessionId,
-      new SessionEventBridge({ sessionId, cwd, capabilities: this.clientCapabilities }),
+      new SessionEventBridge({
+        sessionId,
+        cwd,
+        capabilities: this.clientCapabilities,
+        emit: (notifications) => {
+          for (const notification of notifications) {
+            this.safeNotify(() => this.client.notify("session/update", notification));
+          }
+        },
+      }),
     );
     if (session.sessionFile) {
       this.sessionResolver.registerSession(sessionId, session.sessionFile);
@@ -576,6 +585,7 @@ export class PiAcpAgent {
     }
 
     this.sessionResolver.unregisterSession(sessionId);
+    this.bridges.get(sessionId)?.dispose();
     this.bridges.delete(sessionId);
     this.lastRunMessages.delete(sessionId);
     this.commandsAdvertised.delete(sessionId);

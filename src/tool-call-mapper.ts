@@ -1,12 +1,7 @@
 import type { SessionUpdate, ToolCallStatus } from "@agentclientprotocol/sdk";
 import { SessionUpdateType } from "./session-update-types";
-import {
-  HIDDEN_NESTED_TOOLS,
-  SUBAGENT_TOOL,
-  childCard,
-  runsSeveralChildren,
-  subagentChildren,
-} from "./subagent-cards";
+import { SubagentCalls } from "./subagent-calls";
+import { HIDDEN_NESTED_TOOLS, SUBAGENT_TOOL } from "./subagent-cards";
 import {
   presentResultLocations,
   presentToolCall,
@@ -26,8 +21,7 @@ const SHELL_TOOL = "bash";
  * result, while the result card needs both (an edit's diff comes from its
  * arguments), so the mapper keeps them until the call ends.
  *
- * A `subagent` call that runs several children also gets one card per child,
- * created as each child shows up and updated only when its card changes.
+ * A `subagent` call's cards follow its children, through SubagentCalls.
  *
  * A bash call, for a client that displays terminals the agent feeds, shows a
  * terminal fed with its output instead of text. Its content is then never
@@ -38,22 +32,31 @@ export class ToolCallMapper {
   private readonly calls = new Map<string, { name: string; args: unknown }>();
   /**
    * Last progress content sent per call. Tools report progress far more often
-   * than what a card shows changes (a subagent's every event, for instance).
+   * than what a card shows changes.
    */
   private readonly lastProgress = new Map<string, string>();
   /** Display terminals of the bash calls still running, by tool call id. */
   private readonly terminals = new Map<string, TerminalMirror>();
-  /** Last card sent for each child, by parent tool call id then child key. */
-  private readonly childCards = new Map<
-    string,
-    Map<string, { title: string; serialized: string }>
-  >();
+  private readonly subagents: SubagentCalls;
 
-  constructor(private readonly context: PresentationContext) {}
+  constructor(private readonly context: PresentationContext) {
+    this.subagents = new SubagentCalls(context);
+  }
+
+  /** Whether a subagent call is running, whose children's transcripts may grow. */
+  get subagentsRunning(): boolean {
+    return this.subagents.running;
+  }
+
+  /** Updates for the subagent cards whose children's transcripts grew since the last look. */
+  pollSubagents(): SessionUpdate[] {
+    return this.subagents.poll();
+  }
 
   start(toolCallId: string, name: string, args: unknown, status: ToolCallStatus): SessionUpdate[] {
     this.calls.set(toolCallId, { name, args });
     if (HIDDEN_NESTED_TOOLS.has(name)) return [];
+    if (name === SUBAGENT_TOOL) this.subagents.start(toolCallId, args);
     const view = presentToolCall(name, args, this.context);
     const call = {
       sessionUpdate: SessionUpdateType.ToolCall,
@@ -88,20 +91,20 @@ export class ToolCallMapper {
     const partial = toOutcome(partialResult, false);
     const terminal = this.terminals.get(toolCallId);
     if (terminal) return terminalOutput(toolCallId, terminal.progress(partial));
+    if (name === SUBAGENT_TOOL) return this.subagents.progress(toolCallId, partial.details);
 
-    const updates = this.childCardUpdates(toolCallId, name, args, partial.details);
     const content = presentToolProgress(name, args, partial, this.context);
     const serialized = JSON.stringify(content);
-    if (content !== undefined && serialized !== this.lastProgress.get(toolCallId)) {
-      this.lastProgress.set(toolCallId, serialized);
-      updates.push({
+    if (content === undefined || serialized === this.lastProgress.get(toolCallId)) return [];
+    this.lastProgress.set(toolCallId, serialized);
+    return [
+      {
         sessionUpdate: SessionUpdateType.ToolCallUpdate,
         toolCallId,
         status: "in_progress",
         content,
-      });
-    }
-    return updates;
+      },
+    ];
   }
 
   end(
@@ -112,36 +115,24 @@ export class ToolCallMapper {
   ): SessionUpdate[] {
     const call = this.calls.get(toolCallId) ?? { name: fallbackName, args: undefined };
     this.calls.delete(toolCallId);
+    this.lastProgress.delete(toolCallId);
     if (HIDDEN_NESTED_TOOLS.has(call.name)) return [];
     const outcome = toOutcome(result, isError);
     const status = isError ? "failed" : "completed";
-    const updates = this.childCardUpdates(
-      toolCallId,
-      call.name,
-      call.args,
-      outcome.details,
-      status,
-    );
-    this.childCards.delete(toolCallId);
-    this.lastProgress.delete(toolCallId);
 
     const terminal = this.terminals.get(toolCallId);
     if (terminal) {
       this.terminals.delete(toolCallId);
-      const output = terminal.finish(outcome);
-      updates.push({
-        sessionUpdate: SessionUpdateType.ToolCallUpdate,
-        toolCallId,
-        status,
-        _meta: {
-          ...(output ? { terminal_output: { terminal_id: toolCallId, data: output } } : {}),
-          terminal_exit: { terminal_id: toolCallId, ...exitStatusOf(outcome) },
-        },
-      });
-      return updates;
+      return [terminalEnd(toolCallId, terminal, outcome, status)];
     }
 
-    const content = presentToolResult(call.name, call.args, outcome, this.context);
+    const { updates, ownContent } =
+      call.name === SUBAGENT_TOOL
+        ? this.subagents.end(toolCallId, call.args, outcome)
+        : { updates: [], ownContent: [] };
+    const resultContent = presentToolResult(call.name, call.args, outcome, this.context);
+    const content =
+      ownContent.length > 0 ? [...ownContent, ...(resultContent ?? [])] : resultContent;
     const locations = presentResultLocations(call.name, call.args, outcome, this.context);
     updates.push({
       sessionUpdate: SessionUpdateType.ToolCallUpdate,
@@ -156,44 +147,6 @@ export class ToolCallMapper {
   private showsTerminal(name: string): boolean {
     return name === SHELL_TOOL && this.context.live && this.context.terminalDisplay === true;
   }
-
-  private childCardUpdates(
-    toolCallId: string,
-    name: string,
-    args: unknown,
-    details: unknown,
-    callStatus?: "completed" | "failed",
-  ): SessionUpdate[] {
-    if (name !== SUBAGENT_TOOL || !runsSeveralChildren(args)) return [];
-    const sent =
-      this.childCards.get(toolCallId) ?? new Map<string, { title: string; serialized: string }>();
-    this.childCards.set(toolCallId, sent);
-
-    const updates: SessionUpdate[] = [];
-    for (const child of subagentChildren(details)) {
-      const previous = sent.get(child.key);
-      const fresh = childCard(child, { callStatus, includeOutput: true });
-      // Snapshots do not always repeat a child's agent: keep the best title seen.
-      const card = { ...fresh, title: fresh.title ?? previous?.title ?? "subagent" };
-      const serialized = JSON.stringify(card);
-      if (previous?.serialized === serialized) continue;
-      sent.set(child.key, { title: card.title, serialized });
-
-      // Pi names nested calls `<parent id>/<n>`; child cards follow the same scheme.
-      const childCallId = `${toolCallId}/child-${child.key}`;
-      updates.push(
-        previous === undefined
-          ? {
-              sessionUpdate: SessionUpdateType.ToolCall,
-              toolCallId: childCallId,
-              kind: "think",
-              ...card,
-            }
-          : { sessionUpdate: SessionUpdateType.ToolCallUpdate, toolCallId: childCallId, ...card },
-      );
-    }
-    return updates;
-  }
 }
 
 /** Appends output to a call's display terminal, when there is any. */
@@ -206,6 +159,25 @@ function terminalOutput(toolCallId: string, data: string | undefined): SessionUp
       _meta: { terminal_output: { terminal_id: toolCallId, data } },
     },
   ];
+}
+
+/** Ends a call's display terminal: the rest of its output, then its exit status. */
+function terminalEnd(
+  toolCallId: string,
+  terminal: TerminalMirror,
+  outcome: ToolOutcome,
+  status: "completed" | "failed",
+): SessionUpdate {
+  const output = terminal.finish(outcome);
+  return {
+    sessionUpdate: SessionUpdateType.ToolCallUpdate,
+    toolCallId,
+    status,
+    _meta: {
+      ...(output ? { terminal_output: { terminal_id: toolCallId, data: output } } : {}),
+      terminal_exit: { terminal_id: toolCallId, ...exitStatusOf(outcome) },
+    },
+  };
 }
 
 /**

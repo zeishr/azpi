@@ -30,6 +30,8 @@ export interface SubagentChild {
   key: string;
   agent?: string;
   sessionName?: string;
+  /** The child's own session file, which carries its transcript while it runs. */
+  sessionFile?: string;
   model?: string;
   thinking?: string;
   status: "pending" | "running" | "completed" | "failed" | "detached";
@@ -115,6 +117,7 @@ function workflowChildrenOf(children: unknown[], results: Row[]): SubagentChild[
         key: row.childId as string,
         agent: stringOf(row.agent) ?? stringOf(result.agent),
         sessionName: stringOf(row.sessionName) ?? stringOf(result.sessionName),
+        sessionFile: stringOf(row.sessionFile) ?? stringOf(result.sessionFile),
         model: stringOf(row.model) ?? stringOf(result.model),
         thinking: stringOf(row.thinking) ?? stringOf(result.thinking),
         status: workflowStatus(row.state),
@@ -173,17 +176,24 @@ export function childTitle(child: SubagentChild): string | undefined {
   return title.length > MAX_TITLE_LENGTH ? `${title.slice(0, MAX_TITLE_LENGTH - 1)}…` : title;
 }
 
+export interface ChildCardOptions {
+  callStatus?: "completed" | "failed";
+  includeOutput: boolean;
+  /** The end of the child's transcript, as Markdown, when its session file could be read. */
+  transcript?: string;
+}
+
 /**
  * The card of one child. Once the parent call ended, a child still marked
  * running was cut short with it, so it takes the call's final status.
  */
-export function childCard(
-  child: SubagentChild,
-  options: { callStatus?: "completed" | "failed"; includeOutput: boolean },
-): ChildCard {
+export function childCard(child: SubagentChild, options: ChildCardOptions): ChildCard {
   const status = cardStatus(child.status, options.callStatus);
   const done = status === "completed" || status === "failed";
-  const text = (done ? doneLines(child, options.includeOutput) : liveLines(child)).join("\n\n");
+  const lines = done
+    ? doneLines(child, options.includeOutput, options.transcript)
+    : liveLines(child, options.transcript);
+  const text = lines.join("\n\n");
   return {
     title: childTitle(child),
     status,
@@ -209,23 +219,36 @@ function cardStatus(
   }
 }
 
-function liveLines(child: SubagentChild): string[] {
+/**
+ * The transcript, when there is one, shows every step including the running
+ * one; otherwise the progress rows give the current tool and the last few.
+ */
+function liveLines(child: SubagentChild, transcript: string | undefined): string[] {
   const lines = [statsLine(child, false)];
-  if (child.currentTool) {
-    lines.push(`Running ${toolLabel(child.currentTool, child.currentToolArgs)}`);
-  }
-  const recent = child.recentTools.slice(-RECENT_TOOLS_SHOWN);
-  if (recent.length > 0) {
-    lines.push(recent.map(({ tool, args }) => `- ${toolLabel(tool, args)}`).join("\n"));
+  if (transcript) {
+    lines.push(transcript);
+  } else {
+    if (child.currentTool) {
+      lines.push(`Running ${toolLabel(child.currentTool, child.currentToolArgs)}`);
+    }
+    const recent = child.recentTools.slice(-RECENT_TOOLS_SHOWN);
+    if (recent.length > 0) {
+      lines.push(recent.map(({ tool, args }) => `- ${toolLabel(tool, args)}`).join("\n"));
+    }
   }
   if (child.progressText) lines.push(`Progress: ${child.progressText}`);
   if (child.error) lines.push(`**Error:** ${child.error}`);
   return lines.filter(Boolean);
 }
 
-function doneLines(child: SubagentChild, includeOutput: boolean): string[] {
+function doneLines(
+  child: SubagentChild,
+  includeOutput: boolean,
+  transcript: string | undefined,
+): string[] {
   const lines = [statsLine(child, true)];
   if (child.status === "detached") lines.push("Continues in the background.");
+  if (transcript) lines.push(transcript);
   if (child.error) lines.push(`**Error:** ${child.error}`);
   if (includeOutput && child.finalOutput) lines.push(child.finalOutput);
   return lines.filter(Boolean);
@@ -251,6 +274,7 @@ function toChild(key: string, result: Row, progress: Row | undefined): SubagentC
     key,
     agent: stringOf(result.agent) ?? stringOf(progress?.agent),
     sessionName: stringOf(result.sessionName) ?? stringOf(progress?.sessionName),
+    sessionFile: stringOf(progress?.sessionFile) ?? stringOf(result.sessionFile),
     model: stringOf(progress?.model) ?? stringOf(result.model),
     thinking: stringOf(progress?.thinking) ?? stringOf(result.thinking),
     status: statusOf(result, progress),
